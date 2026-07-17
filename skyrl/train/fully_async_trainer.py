@@ -474,6 +474,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 "skyrl_mini_batch_size": "Generation groups consumed per training step.",
                 "skyrl_gen_group_keep_rate": "Fraction of drained groups kept (not dropped as "
                 "zero-variance) while collecting the last mini-batch.",
+                # Trajectory-time stack: env band + turns-scale factor for the vLLM per-request
+                # queue/prefill/decode bands. Engine bands come from vLLM's own Prometheus metrics.
+                "skyrl_trajectory_completion_time_mean": "Mean per-trajectory end-to-end time (seconds).",
+                "skyrl_trajectory_env_time_mean": "Mean per-trajectory time in env.step() (seconds).",
+                "skyrl_turns_per_trajectory_mean": "Mean engine calls per trajectory; scales vLLM per-request times.",
             }
         )
 
@@ -586,6 +591,17 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                 cur_generation_group_mini_batch,
                                 cur_dropped_groups,
                             )
+
+                        # Trajectory-time components to Prometheus (convert just merged them into
+                        # all_metrics). The env band and the turns scale factor are SkyRL-side; the
+                        # queue/prefill/decode bands come from vLLM's own per-request metrics.
+                        for src_key, gauge_name in (
+                            ("generate/trajectory_completion_time_mean", "skyrl_trajectory_completion_time_mean"),
+                            ("generate/trajectory_env_time_mean", "skyrl_trajectory_env_time_mean"),
+                            ("generate/turns_per_trajectory_mean", "skyrl_turns_per_trajectory_mean"),
+                        ):
+                            if src_key in self.all_metrics:
+                                self._loop_gauges.set(gauge_name, self.all_metrics[src_key])
 
                         # 3. Run training and update consumed UIDs.
                         with Timer("run_training", self.all_timings), self._phase_gauge.phase("training"):

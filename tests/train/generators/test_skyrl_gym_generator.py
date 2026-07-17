@@ -1892,3 +1892,15 @@ async def test_llm_vs_env_time_split_metrics(mock_make, mock_tokenizer, mock_llm
     assert 0.5 < concat_metrics["generate/frac_time_in_env"] < 1.0
     assert concat_metrics["generate/trajectory_llm_time_p90"] == pytest.approx(np.percentile(llm_times * 2, 90).item())
     assert concat_metrics["generate/trajectory_env_time_p90"] == pytest.approx(np.percentile(env_times * 2, 90).item())
+
+
+def test_turns_per_trajectory_mean():
+    """turns_per_trajectory_mean is total assistant runs over trajectories, the vLLM per-request scale."""
+    from skyrl.train.generators.utils import get_rollout_metrics
+
+    responses = [[1, 2, 3, 4, 5], [1, 2, 3, 4, 5]]
+    rewards = [1.0, 1.0]
+    # Runs of consecutive non-zero loss-mask entries are turns: 2 in the first, 3 in the second.
+    loss_masks = [[1, 1, 0, 1, 0], [1, 0, 1, 0, 1]]
+    metrics = get_rollout_metrics(responses, rewards, loss_masks=loss_masks)
+    assert metrics["generate/turns_per_trajectory_mean"] == pytest.approx((2 + 3) / 2)

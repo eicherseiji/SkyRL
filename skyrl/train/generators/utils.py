@@ -469,6 +469,11 @@ def get_rollout_metrics(
                     "generate/tokens_per_turn_max": np.max(turn_token_counts_arr).item(),
                 }
             )
+            # Mean turns (assistant runs) per trajectory. One turn is one engine call, so this scales
+            # vLLM per-request stage times (queue/prefill/decode) up to per-trajectory for the stacked
+            # trajectory-time panel. Meaningful for non-step-wise rollouts, where one row is one
+            # trajectory; under step-wise training a row is a single step so it reads ~1.
+            rollout_metrics["generate/turns_per_trajectory_mean"] = len(turn_token_counts) / len(loss_masks)
 
     if trajectory_completion_times:
         completion_times_arr = np.array(trajectory_completion_times, dtype=np.float64)
