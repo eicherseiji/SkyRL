@@ -63,21 +63,31 @@ endpoints (Ray exposes them for exactly this) and use PromQL.
 
 ## Grafana dashboard
 
-SkyRL ships a Grafana dashboard covering throughput, latency, engine queue
-depth, and KV-cache metrics. It is built from
-[vllm_dashboard.py](skyrl/train/utils/vllm_dashboard.py), which keeps the panel
-definitions and PromQL in one place; the generated JSON is committed next to it
-at `skyrl/train/utils/vllm_dashboard.json`.
+SkyRL ships a Grafana dashboard that reads top to bottom from outcome to root
+cause: trainer starvation, then rollout trajectory time, then engine throughput,
+latency, saturation, and KV cache. Engine panels draw one line per vLLM replica
+with a bold mean overlay so per-replica spread is visible.
+
+It is built from
+[training_dashboard.py](skyrl/train/utils/training_dashboard.py), which keeps the
+panel definitions and PromQL in one place; the generated JSON is committed next
+to it at `skyrl/train/utils/training_dashboard.json`.
 
 Import the committed JSON directly (Dashboards → New → Import), or regenerate it
 against a different Prometheus data source UID:
 
 ```bash
-uv run --isolated --extra dev python -m skyrl.train.utils.vllm_dashboard > vllm_dashboard.json
+uv run --isolated --extra dev python -m skyrl.train.utils.training_dashboard > training_dashboard.json
 ```
 
-The default data source UID matches the reference dashboard; pass a different
-one by editing `DEFAULT_DATASOURCE_UID` or calling `build_dashboard(uid)`.
+The default data source UID matches the reference dashboard; pass a different one
+by editing `DEFAULT_DATASOURCE_UID` or calling `build_dashboard(uid)`.
+
+The trainer-side panels (trainer wait, rollout buffer depth, trajectory time by
+phase, turns per trajectory) read the SkyRL training metrics once they reach
+Prometheus through the wandb dual write. Engine-side panels read the
+`ray_vllm_*` series described above and populate as soon as
+`enable_ray_prometheus_stats` is on.
 
 Names are sanitized on the way out: vLLM's `:` becomes `_`, and Ray's metrics
 agent prepends `ray_`. So vLLM's `vllm:kv_cache_usage_perc` is exported as
