@@ -61,6 +61,24 @@ can query anything vLLM emits — not just the keys in the table.
 To actually query these over time, point a Prometheus server at Ray's metrics
 endpoints (Ray exposes them for exactly this) and use PromQL.
 
+## Grafana dashboard
+
+SkyRL ships a Grafana dashboard covering throughput, latency, engine queue
+depth, and KV-cache metrics. It is built from
+[vllm_dashboard.py](skyrl/train/utils/vllm_dashboard.py), which keeps the panel
+definitions and PromQL in one place; the generated JSON is committed next to it
+at `skyrl/train/utils/vllm_dashboard.json`.
+
+Import the committed JSON directly (Dashboards → New → Import), or regenerate it
+against a different Prometheus data source UID:
+
+```bash
+uv run --isolated --extra dev python -m skyrl.train.utils.vllm_dashboard > vllm_dashboard.json
+```
+
+The default data source UID matches the reference dashboard; pass a different
+one by editing `DEFAULT_DATASOURCE_UID` or calling `build_dashboard(uid)`.
+
 Names are sanitized on the way out: vLLM's `:` becomes `_`, and Ray's metrics
 agent prepends `ray_`. So vLLM's `vllm:kv_cache_usage_perc` is exported as
 `ray_vllm_kv_cache_usage_perc`, and histograms expose `_sum` / `_count` /
