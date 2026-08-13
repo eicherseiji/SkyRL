@@ -1,0 +1,117 @@
+---
+title: "Adaptive Sampling Concurrency"
+---
+
+<Callout type="warn">
+The controller described here is not enabled by a SkyRL training loop or Tinker endpoint yet. This page documents the
+backend-neutral primitive and the intended integration boundary so the service ownership and feedback transport can be
+reviewed before rollout behavior changes.
+</Callout>
+
+RL clients know how many logical trajectories they want, but generally do not know the capacity of the inference backend.
+A fixed client-side trajectory count therefore mixes two separate concerns:
+
+- **Logical concurrency**: how many trajectories the algorithm may have in progress, including trajectories waiting on
+  tools, environments, or inference.
+- **Physical sampling concurrency**: how many sampling requests the inference service should admit at once.
+
+Adaptive admission belongs at the sampling client or service boundary. The training loop can keep submitting logical work;
+the admission controller gates only calls into the sampling backend.
+
+```text
+training loop              sampling service / adapter             inference backend
+logical trajectories  ──▶  resizable admission window  ──▶       Fireworks, vLLM, ...
+                            ▲                       │
+                            └── normalized feedback ┘
+```
+
+This boundary lets the same training loop work with a local SkyRL deployment or a hosted Tinker-compatible service. It
+does not require the loop to discover vLLM replicas, scrape their metrics, or access a generator object directly.
+
+## Feedback Contract
+
+`SamplingFeedback` normalizes the signals available after a sampling request:
+
+| Signal | Admission use | Notes |
+| --- | --- | --- |
+| `queue_duration_s` | AIMD congestion signal | Optional; the backend or service adapter supplies it |
+| `rate_limited` | Multiplicative decrease | Represents an explicit capacity rejection |
+| `prompt_tokens` | Workload summary | Can later support token-aware priority and accounting |
+| `completion_tokens` | Workload summary | Measures realized decode work, not backend capacity |
+| `cache_hit_tokens` | Workload summary | Allows prompt-cache hit rate to be reported |
+| `request_latency_s` | Observability | Includes model work and network time, so it is not treated as queue pressure |
+
+Token counts describe the size of work. They do not provide an absolute concurrency target: a 1-GPU backend and a 16-GPU
+backend can receive the same average token load while having very different spare capacity. The initial controller
+therefore adjusts only when it receives queue pressure or an explicit rate limit.
+
+## Control Law
+
+`AdaptiveSamplingConcurrencyController` uses additive increase/multiplicative decrease (AIMD) over completed-request
+intervals:
+
+- If average queue duration is at or below the target, increase the admission limit by a small fixed step.
+- If average queue duration is above the target, multiply the limit by a decrease ratio.
+- If any request in the interval was rate-limited, take the decrease path.
+- If an interval has no queue or rate-limit feedback, keep the limit unchanged.
+
+The limit stays between configured minimum and maximum values. Decreasing it does not cancel admitted requests; new
+requests wait until in-flight work drains below the new limit.
+
+```python
+from skyrl.utils.adaptive_concurrency import (
+    AdaptiveSamplingConcurrencyController,
+    SamplingFeedback,
+)
+
+controller = AdaptiveSamplingConcurrencyController(
+    initial_limit=16,
+    max_limit=256,
+    queue_duration_target_s=0.2,
+)
+
+async with controller.limiter.slot():
+    response = await sampler.sample(prompt, sampling_params)
+
+adjustment = await controller.observe(
+    SamplingFeedback(
+        queue_duration_s=response.prefill_queue_duration,
+        prompt_tokens=len(prompt_tokens),
+        completion_tokens=len(response.tokens),
+    )
+)
+```
+
+The adapter should publish the returned `ConcurrencyAdjustment` fields as metrics when an interval completes.
+
+## Backend Mappings
+
+### Fireworks
+
+Fireworks' Tinker-compatible `DeploymentSampler` reports `prefill_queue_duration`, which maps directly to
+`queue_duration_s`. This follows the same queue-delay control approach as Fireworks'
+[`AdaptiveConcurrencyController`](https://docs.fireworks.ai/fine-tuning/training-api/reference/deployment-sampler).
+
+### Standard Tinker response
+
+A standard Tinker `SampleResponse` exposes generated sequences and prompt-cache-hit tokens. An adapter can populate token
+and cache summaries from those fields, but the public response does not currently carry backend queue duration. Without
+optional service metadata or rate-limit feedback, the admission limit remains fixed rather than inferring capacity from
+latency.
+
+### Native SkyRL / vLLM
+
+SkyRL can eventually populate the same contract from response metadata added at the router or inference-service boundary.
+The existing vLLM metrics scraper is useful for aggregate monitoring, but coupling this controller to trainer-side metric
+scraping would make hosted and local sampling behave differently.
+
+## Follow-up Integration Decisions
+
+This primitive leaves three decisions for the integration PR:
+
+1. Whether the controller is owned by the Tinker sampling service or by each sampling-client adapter.
+2. How optional queue feedback is transported for backends that do not already return it.
+3. How token estimates, cache locality, and trajectory state become priority hints once basic admission is stable.
+
+The third item is the path toward program-aware scheduling. It is intentionally separate from discovering a safe physical
+concurrency window.

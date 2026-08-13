@@ -4,6 +4,7 @@
     "overview",
     "quickstart",
     "architecture",
+    "adaptive_sampling_concurrency",
     "multi_tenancy",
     "session_based_routing",
     "cookbook",
