@@ -10,6 +10,7 @@ from skyrl.utils.adaptive_concurrency import (
     QueueDelayConcurrencyPolicy,
     ResizableConcurrencyLimiter,
     SamplingCompletion,
+    SamplingConcurrencyController,
     SamplingFeedback,
 )
 
@@ -74,6 +75,69 @@ async def test_slot_releases_after_exception():
     assert limiter.in_flight == 0
     async with limiter.slot():
         assert limiter.in_flight == 1
+
+
+@pytest.mark.asyncio
+async def test_controller_co_locates_policy_and_request_limiter():
+    policy = QueueDelayConcurrencyPolicy(
+        max_limit=8,
+        queue_duration_target_s=0.2,
+        adjustment_interval=1,
+    )
+    controller = SamplingConcurrencyController(policy=policy, initial_limit=2, clock=lambda: 456.0)
+
+    async with controller.slot():
+        assert controller.in_flight == 1
+        assert controller.context() == ConcurrencyContext(current_limit=2, in_flight=1, observed_at_s=456.0)
+        decision = await controller.on_feedback(SamplingFeedback({"queue_duration_s": 0.1}))
+
+    assert controller.policy is policy
+    assert decision == ConcurrencyDecision(desired_limit=3, reason="below_queue_target")
+    assert controller.current_limit == 3
+    assert controller.in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_controller_returns_shedding_to_trajectory_owner():
+    class SheddingPolicy:
+        def on_feedback(self, feedback, policy_context):
+            return ConcurrencyDecision(desired_limit=2, shed_count=3, reason="hard_overload")
+
+        def on_completion(self, completion, policy_context):
+            return None
+
+    controller = SamplingConcurrencyController(policy=SheddingPolicy(), initial_limit=8)
+
+    decision = await controller.on_feedback(SamplingFeedback())
+
+    assert decision == ConcurrencyDecision(desired_limit=2, shed_count=3, reason="hard_overload")
+    assert controller.current_limit == 2
+
+
+@pytest.mark.asyncio
+async def test_controller_forwards_weighted_completion_to_policy():
+    class CompletionPolicy:
+        completion = None
+
+        def on_feedback(self, feedback, policy_context):
+            return None
+
+        def on_completion(self, completion, policy_context):
+            self.completion = completion
+            return ConcurrencyDecision(
+                desired_limit=policy_context.current_limit + completion.admission_units,
+                reason="completion_growth",
+            )
+
+    policy = CompletionPolicy()
+    controller = SamplingConcurrencyController(policy=policy, initial_limit=4)
+    completion = SamplingCompletion(tokens=512, duration_s=2.5, admission_units=3)
+
+    decision = await controller.on_completion(completion)
+
+    assert policy.completion is completion
+    assert decision == ConcurrencyDecision(desired_limit=7, reason="completion_growth")
+    assert controller.current_limit == 7
 
 
 def test_queue_delay_policy_increases_limit_after_feedback_interval():
@@ -181,6 +245,12 @@ def test_policy_protocol_supports_feedback_and_completion_hooks():
     assert policy.on_completion(SamplingCompletion(tokens=128, duration_s=1.25), context(current_limit=4)) is None
 
 
+def test_completion_reports_weighted_sampled_sequence_units():
+    completion = SamplingCompletion(tokens=512, duration_s=2.5, admission_units=4)
+
+    assert completion.admission_units == 4
+
+
 def test_queue_delay_policy_leaves_completion_growth_to_richer_policies():
     policy = QueueDelayConcurrencyPolicy(max_limit=8, queue_duration_target_s=0.2)
 
@@ -266,6 +336,10 @@ def test_contracts_reject_invalid_values():
         SamplingCompletion(tokens=-1, duration_s=1)
     with pytest.raises(ValueError, match="duration_s"):
         SamplingCompletion(tokens=1, duration_s=-1)
+    with pytest.raises(ValueError, match="admission_units"):
+        SamplingCompletion(tokens=1, duration_s=1, admission_units=0)
+    with pytest.raises(TypeError, match="admission_units"):
+        SamplingCompletion(tokens=1, duration_s=1, admission_units=True)
     with pytest.raises(ValueError, match="shed_count"):
         ConcurrencyDecision(desired_limit=1, shed_count=-1)
 

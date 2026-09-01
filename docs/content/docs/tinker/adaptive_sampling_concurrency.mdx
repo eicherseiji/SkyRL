@@ -15,20 +15,26 @@ inference backend. A fixed client-side trajectory count therefore mixes two conc
 - **Physical sampling concurrency**: how many admission units the inference service should run at once.
 
 Adaptive admission belongs in the component that already owns pending work. In fully async native training that is
-`_AsyncStalenessManager`; for Tinker it is `TinkerEngine`. The owner composes one stateful `ConcurrencyPolicy` for each
-independently saturated capacity domain. No standalone controller or admission-adapter layer is required.
+`SkyRLGymGenerator`, which owns episode lifecycle across train and evaluation; for Tinker it is `TinkerEngine`, which
+owns durable pending rows. Native SkyRL composes a process-local `SamplingConcurrencyController`; Tinker reuses the
+policy contract directly with its database-backed dispatcher. No admission-adapter layer is required.
 
 ```text
-backend pressure ── SamplingFeedback ──┐
-                                      │
-completed unit ── SamplingCompletion ─┼─▶ ConcurrencyPolicy ─▶ ConcurrencyDecision
-                                      │                           │
-owner state ── ConcurrencyContext ────┘                           ▼
-                                                     existing admission owner
+SkyRLGymGenerator
+├── episode lifecycle and trajectory registry
+└── SamplingConcurrencyController
+    ├── ConcurrencyPolicy
+    └── ResizableConcurrencyLimiter ◀── RemoteInferenceClient.controller.slot()
+
+TinkerEngine
+├── ConcurrencyPolicy                 # shared contract and algorithms
+└── FutureDB PENDING → DISPATCHED     # durable admission mechanism
 ```
 
-The policy requests effects but never owns queues, durable rows, permits, or tasks. The admission owner applies
-`desired_limit` and, when supported, asks its trajectory registry to apply `shed_count`.
+The policy requests effects but never owns queues, durable rows, permits, or tasks. Native
+`SamplingConcurrencyController` captures context and applies `desired_limit` to its co-located limiter, then returns
+the decision so `SkyRLGymGenerator` can apply `shed_count`. `TinkerEngine` captures the same context and applies the
+decision at its durable dispatch boundary.
 
 ## Policy inputs
 
@@ -69,8 +75,21 @@ Backends that cannot provide the complete shape omit `engine.loads` and select a
 
 ### `SamplingCompletion`
 
-`SamplingCompletion` reports one completed admission unit with its token count, duration, and optional extensible
-metadata. In fully async RL the unit is normally a trajectory group, not every model call within a multi-turn trajectory.
+`SamplingCompletion` reports completed sampled-sequence admission units with their aggregate token count, duration,
+and optional extensible metadata:
+
+```python
+SamplingCompletion(
+    tokens=1536,
+    duration_s=2.4,
+    admission_units=4,
+)
+```
+
+One admission unit always means one active sampled sequence. Native `RemoteInferenceClient` rejects `n > 1` and gates
+each expanded prompt request with weight one. A durable Tinker row has weight `num_samples`, because one API request can
+expand into several sampled sequences. This keeps completion turnover, `current_limit`, and `in_flight` in the same unit
+on both paths.
 
 The explicit completion hook allows a richer policy to pace growth by pipeline turnover. A metrics poll can declare that
 growth is safe, while subsequent completions advance the growth clock. Error completions with zero tokens can be ignored
@@ -88,9 +107,9 @@ ConcurrencyContext(
 )
 ```
 
-`current_limit` and `in_flight` let the policy determine whether admission is binding, compute a new target from current
-load, and calculate how much active work must be shed. `observed_at_s` lets a policy expire stale growth permission without
-owning a timer or clock.
+`current_limit` and `in_flight` are measured in active sampled-sequence units. They let the policy determine whether
+admission is binding and compute a new target from current load. `observed_at_s` lets a policy expire stale growth
+permission without owning a timer or clock.
 
 ## Policy output
 
@@ -106,7 +125,8 @@ ConcurrencyDecision(
 
 - `desired_limit` controls future admission.
 - `shed_count=0` performs a soft trim: the owner blocks new admission and lets current work drain naturally.
-- A positive `shed_count` requests active cancellation when that execution path supports it.
+- A positive `shed_count` requests that many owner-managed cancellation candidates when that execution path supports
+  it. In native fully async training those candidates are individual trajectory tasks, not prompt groups or DB rows.
 - `reason` is suitable for logs and metrics.
 
 The decision deliberately identifies how much work to shed, not which work. In fully async training a separate
@@ -146,38 +166,32 @@ does not infer capacity from token counts or end-to-end latency. A 1-GPU backend
 average token load while having very different spare capacity.
 
 ```python
-import time
-
 from skyrl.utils.adaptive_concurrency import (
-    ConcurrencyContext,
     QueueDelayConcurrencyPolicy,
-    ResizableConcurrencyLimiter,
+    SamplingConcurrencyController,
     SamplingFeedback,
 )
 
-limiter = ResizableConcurrencyLimiter(16)
 policy = QueueDelayConcurrencyPolicy(
     max_limit=256,
     queue_duration_target_s=0.2,
 )
+controller = SamplingConcurrencyController(policy=policy, initial_limit=16)
 
-# The existing admission owner captures its state and applies the decision.
-decision = policy.on_feedback(
+# The controller captures its limiter state and applies desired_limit itself.
+decision = await controller.on_feedback(
     SamplingFeedback(
         {
             "queue_duration_s": response.prefill_queue_duration,
             "prompt_tokens": len(prompt_tokens),
             "completion_tokens": len(response.tokens),
         }
-    ),
-    ConcurrencyContext(
-        current_limit=limiter.limit,
-        in_flight=limiter.in_flight,
-        observed_at_s=time.monotonic(),
-    ),
+    )
 )
-if decision is not None:
-    await limiter.resize(decision.desired_limit)
+
+# Every native model request, including evaluation, borrows the same gate.
+async with controller.slot():
+    response = await inference_client._generate_single(...)
 ```
 
 ## Backend mappings
@@ -185,11 +199,17 @@ if decision is not None:
 ### Native SkyRL / managed vLLM
 
 `VLLMMetricsScraper` already exposes several aggregate load signals. Extending its output with a coherent `engine.loads`
-snapshot would make a rich engine-load policy possible. `_AsyncStalenessManager` would compose that policy, enforce the
-result together with the algorithmic staleness bound, and provide current admission context.
+snapshot would make a rich engine-load policy possible. `SkyRLGymGenerator` would own one
+`SamplingConcurrencyController` across train and evaluation. `RemoteInferenceClient` would borrow that controller and
+call `controller.slot()` around each prompt request; it would not own a second adaptive policy or limit.
 
-Selective shedding additionally requires cancellable per-group child tasks and an in-flight trajectory registry. The
-long-lived generator worker loop itself must not be cancelled because that would permanently shrink the worker pool.
+This request gate applies to synchronous, one-step asynchronous, and fully asynchronous native training because all
+standard paths converge on the same generator and client. `_AsyncStalenessManager` remains a separate algorithmic gate
+over complete prompt groups in fully async training; its group count is not the physical sampling limit.
+
+Selective shedding additionally requires cancellable per-episode `agent_loop()` tasks and an in-flight trajectory
+registry in `SkyRLGymGenerator`. The long-lived fully async generator worker loop and its complete prompt-group slot must
+not be cancelled because training consumes groups atomically.
 
 ### Fireworks
 
@@ -202,6 +222,19 @@ can drive `QueueDelayConcurrencyPolicy`.
 would admit durable `PENDING` work in the background and atomically move admitted rows to `DISPATCHED` before launching
 engine execution or concurrent forwarding.
 
+Tinker reuses `SamplingFeedback`, `SamplingCompletion`, `ConcurrencyContext`, `ConcurrencyDecision`, and the selected
+`ConcurrencyPolicy`; it does not reuse the native process-local `ResizableConcurrencyLimiter`. Its admission condition
+counts the sum of `num_samples` for active `DISPATCHED` sampling rows, not merely the number of rows:
+
+```text
+dispatched_units = Σ row.num_samples for active DISPATCHED rows
+admit row only when dispatched_units + row.num_samples <= desired_limit
+```
+
+For liveness, a row whose `num_samples` exceeds `desired_limit` is admitted only when no other sampling units are active;
+it temporarily exceeds the soft limit by itself. Silently counting that row as one unit would make the native and Tinker
+controller limits incomparable.
+
 A standard Tinker response can provide token and cache summaries but may not expose queue or engine pressure. In that
 case `FixedConcurrencyPolicy` is the safe default. Lowering admission can always delay future dispatch; cancelling a
 hosted in-flight request requires explicit transport support.
@@ -211,7 +244,7 @@ hosted in-flight request requires explicit transport support.
 The contract is intentionally sufficient for a Prime-RL-style controller:
 
 - `engine.loads` carries the coherent capacity and pressure snapshot.
-- `on_completion` supports turnover-paced multiplicative growth.
+- `on_completion` supports turnover-paced multiplicative growth in sampled-sequence units.
 - `ConcurrencyContext` replaces callbacks that read the dispatcher's current limit and in-flight count.
 - `desired_limit` expresses growth, soft trimming, and hard cuts.
 - `shed_count` expresses the in-flight excess to cancel after a hard cut.
@@ -223,6 +256,8 @@ state inside `EngineLoadConcurrencyPolicy`. Porting that algorithm does not requ
 
 1. Implement and test `EngineLoadConcurrencyPolicy` against recorded vLLM metric traces.
 2. Extend `VLLMMetricsScraper` to construct coherent `engine.loads` snapshots.
-3. Compose policies in `_AsyncStalenessManager` and `TinkerEngine` with one instance per capacity domain.
-4. Add per-group child tasks, an in-flight registry, and cancellation accounting for fully async trajectory shedding.
-5. Add Tinker's `DISPATCHED` state and concurrent background forwarding before applying adaptive admission there.
+3. Compose `SamplingConcurrencyController` in `SkyRLGymGenerator` and share its `slot()` boundary with
+   `RemoteInferenceClient` for train and evaluation model requests.
+4. Add per-episode child tasks, an in-flight registry, and cancellation accounting for fully async trajectory shedding.
+5. Add Tinker's `DISPATCHED` state, weighted `num_samples` accounting, and concurrent background forwarding before
+   applying adaptive admission there.

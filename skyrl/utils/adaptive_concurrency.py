@@ -2,7 +2,8 @@
 
 import asyncio
 import math
-from collections.abc import AsyncIterator, Mapping
+import time
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Protocol, TypeAlias, TypedDict, runtime_checkable
@@ -72,15 +73,17 @@ class SamplingFeedback:
 
 @dataclass(frozen=True)
 class SamplingCompletion:
-    """Lifecycle event for one completed admission unit.
+    """Lifecycle event for completed sampling admission units.
 
-    An admission unit is the work counted by ``ConcurrencyContext.in_flight``.
-    In fully async RL this is normally a trajectory group, not each individual
-    model call made while that trajectory is running.
+    One admission unit is one active sampled sequence. Native SkyRL admits each
+    prompt request with weight one. A durable request that produces multiple
+    sequences, such as Tinker's ``num_samples``, reports that weight through
+    ``admission_units`` so policy turnover uses the same unit as admission.
     """
 
     tokens: int
     duration_s: float
+    admission_units: int = 1
     metrics: Mapping[str, JsonValue] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -92,6 +95,10 @@ class SamplingCompletion:
             raise TypeError(f"duration_s must be numeric, got {type(self.duration_s).__name__}")
         if not math.isfinite(self.duration_s) or self.duration_s < 0:
             raise ValueError(f"duration_s must be a finite non-negative value, got {self.duration_s}")
+        if isinstance(self.admission_units, bool) or not isinstance(self.admission_units, int):
+            raise TypeError(f"admission_units must be an integer, got {type(self.admission_units).__name__}")
+        if self.admission_units < 1:
+            raise ValueError(f"admission_units must be at least 1, got {self.admission_units}")
         metrics = dict(self.metrics)
         _validate_json_value(metrics, path="metrics")
         object.__setattr__(self, "metrics", metrics)
@@ -99,7 +106,11 @@ class SamplingCompletion:
 
 @dataclass(frozen=True)
 class ConcurrencyContext:
-    """Admission state captured by the owner when a policy hook runs."""
+    """Admission state captured by the owner when a policy hook runs.
+
+    ``current_limit`` and ``in_flight`` use sampled-sequence admission units,
+    not API rows, trajectory groups, or generator worker counts.
+    """
 
     current_limit: int
     in_flight: int
@@ -124,7 +135,12 @@ class ConcurrencyContext:
 
 @dataclass(frozen=True)
 class ConcurrencyDecision:
-    """Effects requested by a policy and applied by the admission owner."""
+    """Effects requested by a policy and applied by the admission owner.
+
+    ``desired_limit`` uses sampled-sequence admission units. ``shed_count`` is
+    a count of owner-managed cancellation candidates—for native fully async
+    training, individual trajectory tasks—rather than a durable-row count.
+    """
 
     desired_limit: int
     shed_count: int = 0
@@ -145,7 +161,7 @@ class ConcurrencyDecision:
 
 @runtime_checkable
 class ConcurrencyPolicy(Protocol):
-    """Stateful policy shared by independently saturated capacity domains.
+    """Stateful strategy shared by sampling admission owners.
 
     The policy requests effects but never owns admission permits, durable rows,
     or trajectory tasks. The component that already owns pending work supplies
@@ -212,13 +228,92 @@ class ResizableConcurrencyLimiter:
 
     @asynccontextmanager
     async def slot(self) -> AsyncIterator[None]:
-        """Hold one admission slot for the duration of a sampling unit."""
+        """Hold one sampled-sequence admission unit for one model request."""
 
         await self.acquire()
         try:
             yield
         finally:
             await self.release()
+
+
+class SamplingConcurrencyController:
+    """Co-locate one concurrency policy with the limiter it controls.
+
+    Native ``SkyRLGymGenerator`` owns one controller and shares it with the
+    ``RemoteInferenceClient`` request path. The client calls :meth:`slot` but
+    does not own a second adaptive limit. Policy decisions resize this
+    controller's limiter atomically with respect to other policy callbacks.
+
+    ``shed_count`` is deliberately returned to the generator: the controller
+    owns sampling permits, while the generator owns cancellable trajectories.
+    Durable admission owners such as ``TinkerEngine`` reuse the policy
+    contracts directly and apply decisions to their database transition rather
+    than using this process-local limiter.
+    """
+
+    def __init__(
+        self,
+        *,
+        policy: ConcurrencyPolicy,
+        initial_limit: int,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._policy = policy
+        self._limiter = ResizableConcurrencyLimiter(initial_limit)
+        self._clock = clock
+        self._policy_lock = asyncio.Lock()
+
+    @property
+    def policy(self) -> ConcurrencyPolicy:
+        return self._policy
+
+    @property
+    def current_limit(self) -> int:
+        return self._limiter.limit
+
+    @property
+    def in_flight(self) -> int:
+        return self._limiter.in_flight
+
+    @property
+    def waiting(self) -> int:
+        return self._limiter.waiting
+
+    def context(self) -> ConcurrencyContext:
+        """Capture the limiter state supplied to the next policy hook."""
+
+        return ConcurrencyContext(
+            current_limit=self.current_limit,
+            in_flight=self.in_flight,
+            observed_at_s=self._clock(),
+        )
+
+    @asynccontextmanager
+    async def slot(self) -> AsyncIterator[None]:
+        """Hold one native model-request unit in the shared sampling window."""
+
+        async with self._limiter.slot():
+            yield
+
+    async def on_feedback(self, feedback: SamplingFeedback) -> ConcurrencyDecision | None:
+        """Run the policy feedback hook and apply its requested limit."""
+
+        async with self._policy_lock:
+            decision = self._policy.on_feedback(feedback, self.context())
+            return await self._apply(decision)
+
+    async def on_completion(self, completion: SamplingCompletion) -> ConcurrencyDecision | None:
+        """Run the policy completion hook and apply its requested limit."""
+
+        async with self._policy_lock:
+            decision = self._policy.on_completion(completion, self.context())
+            return await self._apply(decision)
+
+    async def _apply(self, decision: ConcurrencyDecision | None) -> ConcurrencyDecision | None:
+        if decision is not None:
+            await self._limiter.resize(decision.desired_limit)
+        return decision
 
 
 class FixedConcurrencyPolicy:
