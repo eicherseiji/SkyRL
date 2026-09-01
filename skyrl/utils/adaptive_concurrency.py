@@ -496,6 +496,195 @@ class FixedConcurrencyPolicy:
         return None
 
 
+class EngineLoadConcurrencyPolicy:
+    """V1 adaptive policy for coherent per-engine vLLM load snapshots.
+
+    The policy grows by pipeline turnover while the most recent scrape is
+    clear, soft-trims when KV usage loses headroom, and cuts on preemptions or
+    a persistent capacity queue.  It is intentionally a state machine only:
+    the controller applies the requested limit and a trajectory owner may
+    later consume ``shed_count``.  Native V1 keeps active shedding disabled,
+    so every downward resize drains naturally.
+
+    Thresholds are conservative implementation constants rather than user
+    hyperparameters.  The public tuning surface is the initial/min/max window;
+    exposing every threshold before there is operating data would merely move
+    manual concurrency tuning into a larger configuration space.
+    """
+
+    TURNOVER_GROWTH = 1.25
+    BINDING_FRACTION = 0.9
+    KV_USAGE_GROW = 0.6
+    KV_USAGE_SOFT_CAP = 0.8
+    KV_USAGE_HARD_CAP = 0.9
+    KV_USAGE_TARGET = 0.7
+    KV_TRIM_COOLDOWN_POLLS = 6
+    QUEUE_RATIO = 0.5
+    QUEUE_PERSISTENCE_POLLS = 6
+    QUEUE_CUT_FRACTION = 0.9
+    PREEMPTION_CUT_FRACTION = 0.8
+    ESCALATED_CUT_FRACTION = 0.5
+    ESCALATION_GRACE_POLLS = 6
+    GROWTH_GATE_TTL_S = 15.0
+
+    def __init__(
+        self,
+        *,
+        min_limit: int = 1,
+        max_limit: int,
+        enable_active_shedding: bool = False,
+    ) -> None:
+        if min_limit < 1:
+            raise ValueError(f"min_limit must be at least 1, got {min_limit}")
+        if max_limit < min_limit:
+            raise ValueError(f"max_limit must be at least min_limit ({min_limit}), got {max_limit}")
+        self.min_limit = min_limit
+        self.max_limit = max_limit
+        self.enable_active_shedding = enable_active_shedding
+
+        self._cap: float | None = None
+        self._turnover = 0.0
+        self._can_grow = False
+        self._can_grow_until_s = 0.0
+        self._previous_waiting: dict[str, int] = {}
+        self._queue_overload_polls = 0
+        self._trim_cooldown_polls = 0
+        self._draining = False
+        self._escalated = False
+        self._escalation_grace_polls = 0
+
+    def on_feedback(self, feedback: SamplingFeedback, context: ConcurrencyContext) -> ConcurrencyDecision | None:
+        """Classify one coherent scrape and request a resize when needed."""
+
+        if not isinstance(feedback, VLLMEngineSamplingFeedback):
+            return None
+
+        loads = tuple(load for load in feedback.engine_loads if load.role != "prefill")
+        if not loads:
+            return None
+        self._sync_cap(context)
+
+        max_usage = max(load.kv_usage for load in loads)
+        total_running = sum(load.running for load in loads)
+        total_capacity_waiting = sum(
+            load.waiting_capacity if load.waiting_capacity is not None else load.waiting for load in loads
+        )
+        preempted = any(load.preemptions_delta > 0 for load in loads)
+
+        if total_running > 0 and total_capacity_waiting > self.QUEUE_RATIO * total_running:
+            self._queue_overload_polls += 1
+        else:
+            self._queue_overload_polls = 0
+        queue_overload = self._queue_overload_polls >= self.QUEUE_PERSISTENCE_POLLS
+
+        # A queue observed in two successive polls is pressure even before it
+        # reaches the hard, ratio-based cut.  It closes the growth gate without
+        # overreacting to a single turn-completion burst.
+        repeated_waiting = any(load.waiting > 0 and self._previous_waiting.get(load.engine_id, 0) > 0 for load in loads)
+        self._previous_waiting = {load.engine_id: load.waiting for load in loads}
+
+        if self._draining and context.in_flight <= context.current_limit and not preempted and not queue_overload:
+            self._draining = False
+            self._escalation_grace_polls = self.ESCALATION_GRACE_POLLS
+        if not self._draining and self._escalated:
+            self._escalation_grace_polls -= 1
+            if self._escalation_grace_polls <= 0:
+                self._escalated = False
+
+        self._trim_cooldown_polls = max(0, self._trim_cooldown_polls - 1)
+        self._can_grow = (
+            max_usage <= self.KV_USAGE_GROW
+            and total_capacity_waiting == 0
+            and not repeated_waiting
+            and not preempted
+            and not self._draining
+        )
+        self._can_grow_until_s = context.observed_at_s + self.GROWTH_GATE_TTL_S
+
+        if self._draining:
+            return None
+
+        if preempted or queue_overload:
+            cut_fraction = (
+                self.ESCALATED_CUT_FRACTION
+                if self._escalated
+                else (self.QUEUE_CUT_FRACTION if queue_overload else self.PREEMPTION_CUT_FRACTION)
+            )
+            target = self._clamp(math.floor(context.in_flight * cut_fraction))
+            reason = "engine_queue_overload" if queue_overload else "engine_preemptions"
+            self._queue_overload_polls = 0
+            self._draining = True
+            self._escalated = True
+            return self._resize_down(target, context, reason=reason, hard=True)
+
+        if max_usage > self.KV_USAGE_SOFT_CAP and context.in_flight > 0 and self._trim_cooldown_polls == 0:
+            target = self._clamp(math.floor(context.in_flight * self.KV_USAGE_TARGET / max_usage))
+            hard = max_usage > self.KV_USAGE_HARD_CAP
+            self._trim_cooldown_polls = self.KV_TRIM_COOLDOWN_POLLS
+            return self._resize_down(
+                target,
+                context,
+                reason="kv_hard_trim" if hard else "kv_soft_trim",
+                hard=hard,
+            )
+
+        return None
+
+    def on_completion(self, completion: SamplingCompletion, context: ConcurrencyContext) -> ConcurrencyDecision | None:
+        """Pace multiplicative growth by completed admission-unit turnover."""
+
+        self._sync_cap(context)
+        completed_in_flight = context.in_flight + completion.admission_units
+        fraction = completion.admission_units / max(completed_in_flight, completion.admission_units)
+        self._turnover += fraction
+        if completion.tokens <= 0:
+            return None
+        if not (
+            self._can_grow
+            and context.observed_at_s < self._can_grow_until_s
+            and completed_in_flight >= self.BINDING_FRACTION * context.current_limit
+        ):
+            return None
+
+        assert self._cap is not None
+        self._cap = self._clamp_float(self._cap * self.TURNOVER_GROWTH**fraction)
+        desired_limit = int(self._cap)
+        if desired_limit == context.current_limit:
+            return None
+        return ConcurrencyDecision(desired_limit=desired_limit, reason="clear_engine_turnover")
+
+    @property
+    def turnover(self) -> float:
+        """Completed pipeline turnovers, exposed for observability and tests."""
+
+        return self._turnover
+
+    def _sync_cap(self, context: ConcurrencyContext) -> None:
+        if self._cap is None:
+            self._cap = float(context.current_limit)
+
+    def _resize_down(
+        self,
+        target: int,
+        context: ConcurrencyContext,
+        *,
+        reason: str,
+        hard: bool,
+    ) -> ConcurrencyDecision | None:
+        target = min(target, context.current_limit)
+        self._cap = float(target)
+        if target == context.current_limit:
+            return None
+        shed_count = max(0, context.in_flight - target) if hard and self.enable_active_shedding else 0
+        return ConcurrencyDecision(desired_limit=target, shed_count=shed_count, reason=reason)
+
+    def _clamp(self, value: int) -> int:
+        return min(self.max_limit, max(self.min_limit, value))
+
+    def _clamp_float(self, value: float) -> float:
+        return min(float(self.max_limit), max(float(self.min_limit), value))
+
+
 @dataclass
 class _QueueDelayAccumulator:
     sample_count: int = 0

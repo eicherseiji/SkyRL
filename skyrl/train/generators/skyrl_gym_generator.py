@@ -38,6 +38,7 @@ from skyrl.train.generators.utils import (
     get_rollout_metrics,
 )
 from skyrl.utils.adaptive_concurrency import (
+    EngineLoadConcurrencyPolicy,
     FixedConcurrencyPolicy,
     QueueDelayConcurrencyPolicy,
     SamplingConcurrencyController,
@@ -184,6 +185,25 @@ class SkyRLGymGenerator(GeneratorInterface):
                     adjustment_interval=concurrency_cfg.adjustment_interval,
                     additive_step=concurrency_cfg.additive_step,
                     decrease_ratio=concurrency_cfg.decrease_ratio,
+                )
+            elif concurrency_cfg.policy == "engine_load":
+                if not generator_cfg.inference_engine.run_engines_locally:
+                    raise ValueError(
+                        "sampling concurrency policy 'engine_load' currently requires SkyRL-managed local vLLM engines"
+                    )
+                if not generator_cfg.inference_engine.enable_ray_prometheus_stats:
+                    raise ValueError(
+                        "sampling concurrency policy 'engine_load' requires "
+                        "generator.inference_engine.enable_ray_prometheus_stats=true"
+                    )
+                if generator_cfg.inference_engine.enable_pd:
+                    raise ValueError(
+                        "sampling concurrency policy 'engine_load' does not yet support prefill/decode "
+                        "role attribution"
+                    )
+                policy = EngineLoadConcurrencyPolicy(
+                    min_limit=concurrency_cfg.min_limit,
+                    max_limit=concurrency_cfg.max_limit,
                 )
             else:  # Defensive for programmatic configs that bypass Literal validation.
                 raise ValueError(f"Unknown sampling concurrency policy: {concurrency_cfg.policy}")

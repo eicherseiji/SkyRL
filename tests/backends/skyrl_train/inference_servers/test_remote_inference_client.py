@@ -29,6 +29,7 @@ from skyrl.backends.skyrl_train.inference_servers.setup import (
 )
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.utils.adaptive_concurrency import (
+    EngineLoadConcurrencyPolicy,
     FixedConcurrencyPolicy,
     RequestSamplingFeedback,
     SamplingConcurrencyController,
@@ -511,6 +512,43 @@ class TestDataPlane:
         assert [feedback.prompt_tokens for feedback in policy.feedback] == [3, 2]
         assert [feedback.completion_tokens for feedback in policy.feedback] == [3, 3]
         assert len(policy.completions) == 2
+
+    @pytest.mark.asyncio
+    async def test_engine_load_policy_lazily_starts_vllm_feedback_producer(self, client, monkeypatch):
+        producers = []
+
+        class FakeProducer:
+            def __init__(self, controller, **kwargs):
+                self.controller = controller
+                self.kwargs = kwargs
+                self.starts = 0
+                producers.append(self)
+
+            def start(self):
+                self.starts += 1
+
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(
+            "skyrl.train.utils.vllm_metrics_scraper.VLLMEngineFeedbackProducer",
+            FakeProducer,
+        )
+        policy = EngineLoadConcurrencyPolicy(min_limit=1, max_limit=16)
+        controller = SamplingConcurrencyController(policy=policy, initial_limit=4)
+        client.set_sampling_concurrency_controller(controller)
+
+        await client.generate(
+            {
+                "prompt_token_ids": [[1, 2, 3]],
+                "sampling_params": {"max_tokens": 100},
+            }
+        )
+
+        assert len(producers) == 1
+        assert producers[0].controller is controller
+        assert producers[0].kwargs["model_server_urls"] == client.server_urls
+        assert producers[0].starts == 1
 
     @pytest.mark.asyncio
     async def test_generate_with_session_id(self, client):

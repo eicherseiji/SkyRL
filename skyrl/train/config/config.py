@@ -1223,8 +1223,8 @@ class SamplingConcurrencyConfig(BaseConfig):
 
     enabled: bool = False
     """Enable the resizable sampling limiter. Disabled preserves the existing static semaphore."""
-    policy: Literal["fixed", "queue_delay"] = "fixed"
-    """Built-in policy. ``queue_delay`` requires request feedback from a transparent hosted backend."""
+    policy: Literal["fixed", "queue_delay", "engine_load"] = "fixed"
+    """Built-in policy. ``engine_load`` consumes managed vLLM KV, queue, and preemption metrics."""
     initial_limit: int = 8
     """Initial number of sampled sequences admitted to generation."""
     min_limit: int = 1

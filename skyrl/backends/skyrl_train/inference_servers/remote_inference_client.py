@@ -82,6 +82,7 @@ from skyrl.env_vars import (
     SKYRL_HTTP_CONNECTION_LIMIT,
 )
 from skyrl.utils.adaptive_concurrency import (
+    EngineLoadConcurrencyPolicy,
     RequestSamplingFeedback,
     SamplingCompletion,
     SamplingConcurrencyController,
@@ -106,6 +107,7 @@ if TYPE_CHECKING:
     from skyrl.backends.skyrl_train.weight_sync.transfer_strategy import (
         WeightSyncInitInfo,
     )
+    from skyrl.train.utils.vllm_metrics_scraper import VLLMEngineFeedbackProducer
 
 
 logger = logging.getLogger(__name__)
@@ -236,6 +238,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
     _detok_sem: Optional[asyncio.Semaphore] = field(default=None, repr=False)
     _sem_loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
     _sampling_concurrency_controller: Optional[SamplingConcurrencyController] = field(default=None, repr=False)
+    _vllm_feedback_producer: Optional["VLLMEngineFeedbackProducer"] = field(default=None, repr=False)
     # Monotonic counter of weight syncs (see `increment_weight_version`); source of the prefix-cache salt.
     _weight_version: int = field(default=0, repr=False)
 
@@ -252,7 +255,27 @@ class RemoteInferenceClient(InferenceEngineInterface):
         """Use the generator-owned controller for per-prompt generation admission."""
 
         self._sampling_concurrency_controller = controller
+        self._vllm_feedback_producer = None
         return True
+
+    def _ensure_vllm_feedback_producer(self) -> None:
+        """Lazily start engine feedback when the borrowed policy consumes it."""
+
+        controller = self._sampling_concurrency_controller
+        if controller is None or not isinstance(controller.policy, EngineLoadConcurrencyPolicy):
+            return
+        if self._vllm_feedback_producer is None:
+            # Keep the concrete managed-vLLM dependency out of the backend-neutral
+            # client interface and avoid Ray metrics discovery for other policies.
+            from skyrl.train.utils.vllm_metrics_scraper import (
+                VLLMEngineFeedbackProducer,
+            )
+
+            self._vllm_feedback_producer = VLLMEngineFeedbackProducer(
+                controller,
+                model_server_urls=self.server_urls,
+            )
+        self._vllm_feedback_producer.start()
 
     def __post_init__(self):
         if self.data_parallel_size <= 0:
@@ -419,6 +442,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         mm_features = input_batch.get("mm_features")
         cache_salt = input_batch.get("cache_salt")
         get_logprobs = sampling_params.get("logprobs") is not None
+        self._ensure_vllm_feedback_producer()
 
         # Two semaphores decouple the generate and detokenize stages:
         #   gen_sem:   limits concurrent in-flight generate requests so we don't
@@ -1434,6 +1458,9 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
     async def teardown(self) -> None:
         """Close HTTP session."""
+        if self._vllm_feedback_producer is not None:
+            await self._vllm_feedback_producer.aclose()
+            self._vllm_feedback_producer = None
         if self._session and not self._session.closed:
             await self._session.close()
             self._session = None
@@ -1457,6 +1484,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         state["_gen_sem"] = None
         state["_detok_sem"] = None
         state["_sem_loop"] = None
+        state["_vllm_feedback_producer"] = None
         return state
 
     def __setstate__(self, state: dict) -> None:
@@ -1466,8 +1494,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
         self._gen_sem = None
         self._detok_sem = None
         self._sem_loop = None
+        self._vllm_feedback_producer = None
 
     async def aclose(self):
+        if self._vllm_feedback_producer is not None:
+            await self._vllm_feedback_producer.aclose()
+            self._vllm_feedback_producer = None
         if self._session is not None:
             try:
                 await self._session.close()

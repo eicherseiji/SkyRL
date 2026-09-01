@@ -3,9 +3,10 @@ title: "Adaptive Sampling Concurrency"
 ---
 
 <Callout type="warn">
-This is an opt-in first integration. Native request admission, Tinker's durable `DISPATCHED` transition, asynchronous
-external forwarding, and request-level feedback are wired. The richer vLLM engine-load policy and trajectory-shedding
-path described below remain proposed.
+This is an opt-in first integration. Native request admission, managed-vLLM engine feedback,
+`EngineLoadConcurrencyPolicy`, Tinker's durable `DISPATCHED` transition, asynchronous external forwarding, and
+request-level hosted feedback are wired. Active fully async trajectory shedding remains follow-up work; v1 applies
+downward engine-load decisions by closing admission and draining existing work.
 </Callout>
 
 RL clients know how many logical trajectories they want, but generally do not know the physical capacity of the
@@ -22,7 +23,7 @@ policy contract directly with its database-backed dispatcher. No admission-adapt
 
 ```text
 SkyRLGymGenerator
-├── episode lifecycle and trajectory registry
+├── episode lifecycle
 └── SamplingConcurrencyController
     ├── ConcurrencyPolicy
     └── ResizableConcurrencyLimiter ◀── RemoteInferenceClient.controller.slot()
@@ -35,9 +36,9 @@ TinkerEngine
 ```
 
 The policy requests effects but never owns queues, durable rows, permits, or tasks. Native
-`SamplingConcurrencyController` captures context and applies `desired_limit` to its co-located limiter, then returns
-the decision so `SkyRLGymGenerator` can apply `shed_count`. `TinkerEngine` captures the same context and applies the
-decision at its durable dispatch boundary.
+`SamplingConcurrencyController` captures context and applies `desired_limit` to its co-located limiter. It returns the
+decision to its caller; a future native trajectory-action sink can forward `shed_count` to `SkyRLGymGenerator`.
+`TinkerEngine` captures the same context and applies the decision at its durable dispatch boundary.
 
 ## Policy inputs
 
@@ -168,7 +169,7 @@ The intended policy tiers are:
 
 | Policy | Required visibility | Status |
 | --- | --- | --- |
-| `EngineLoadConcurrencyPolicy` | Per-engine KV, capacity, queue, role, and preemption data | Proposed |
+| `EngineLoadConcurrencyPolicy` | Per-engine KV, capacity, queue, role, and preemption data | Implemented for managed, non-P/D vLLM |
 | `QueueDelayConcurrencyPolicy` | Queue duration or explicit rate limiting | Implemented as a primitive |
 | `FixedConcurrencyPolicy` | No trustworthy pressure signal | Implemented fallback |
 
@@ -204,16 +205,45 @@ async with controller.slot():
     response = await inference_client._generate_single(...)
 ```
 
+`EngineLoadConcurrencyPolicy` is the v1 production policy for managed vLLM. It uses a small fixed set of conservative
+implementation thresholds rather than exposing another tuning surface:
+
+- a fresh clear scrape opens a short-lived growth gate; successful completions grow the limit multiplicatively by
+  completed pipeline turnover, and only while admission is binding;
+- KV usage above the soft threshold lowers the limit to restore headroom and lets existing work drain;
+- preemptions or a persistent capacity queue make a larger cut and hold further cuts while the pool drains;
+- incomplete or stale metric snapshots never authorize growth.
+
+The initial, minimum, and maximum limits remain configuration. Active cancellation is deliberately disabled in v1, so
+even a hard KV trim returns `shed_count=0` on the built-in native path.
+
 ## Backend mappings
 
 ### Native SkyRL / managed vLLM
 
 `SkyRLGymGenerator` now owns one opt-in `SamplingConcurrencyController` across train and evaluation.
 `RemoteInferenceClient` borrows that controller and calls `controller.slot()` around each prompt request; it does not
-own a second adaptive policy or limit. Successful requests report typed latency/token completion data.
+own a second adaptive policy or limit. Successful requests report typed latency/token completion data. When the
+selected policy is `engine_load`, the client lazily starts one concrete `VLLMEngineFeedbackProducer` that reuses
+`VLLMMetricsScraper`, preserves Ray/vLLM replica identity, computes preemption deltas, and pushes coherent snapshots
+into that same controller.
 
-`VLLMMetricsScraper` already exposes several aggregate load signals. Extending its output with a coherent per-engine
-snapshot is still required before enabling a rich engine-load policy.
+Select it with:
+
+```yaml
+generator:
+  sampling_concurrency:
+    enabled: true
+    policy: engine_load
+    initial_limit: 8
+    min_limit: 1
+    max_limit: 256
+```
+
+This path currently requires SkyRL-managed local engines and
+`generator.inference_engine.enable_ray_prometheus_stats=true`. P/D mode is rejected for v1 because the Ray metrics
+exposition does not currently attribute each replica to the prefill or decode server group; treating prefill pressure
+as decode pressure would be worse than falling back to a fixed limit.
 
 This request gate applies to synchronous, one-step asynchronous, and fully asynchronous native training because all
 standard paths converge on the same generator and client. `_AsyncStalenessManager` remains a separate algorithmic gate
@@ -221,7 +251,8 @@ over complete prompt groups in fully async training; its group count is not the 
 
 Selective shedding additionally requires cancellable per-episode `agent_loop()` tasks and an in-flight trajectory
 registry in `SkyRLGymGenerator`. The long-lived fully async generator worker loop and its complete prompt-group slot must
-not be cancelled because training consumes groups atomically.
+not be cancelled because training consumes groups atomically. Until that exists, hard pressure closes request admission
+but cannot immediately reclaim KV held by already-running multi-turn trajectories.
 
 ### Fireworks
 
@@ -281,9 +312,10 @@ A standard Tinker response can provide token and cache summaries but may not exp
 case `FixedConcurrencyPolicy` is the safe default. Lowering admission delays future dispatch; cancelling a hosted
 in-flight request still requires explicit transport support.
 
-## Engine-load policy compatibility
+## Engine-load policy behavior
 
-The contract is intentionally sufficient for a Prime-RL-style controller:
+The implemented contract supports the same major control actions as the
+[Prime-RL concurrency controller](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/src/prime_rl/orchestrator/concurrency.py):
 
 - `engine.loads` carries the coherent capacity and pressure snapshot.
 - `on_completion` supports turnover-paced multiplicative growth in sampled-sequence units.
@@ -291,13 +323,17 @@ The contract is intentionally sufficient for a Prime-RL-style controller:
 - `desired_limit` expresses growth, soft trimming, and hard cuts.
 - `shed_count` expresses the in-flight excess to cancel after a hard cut.
 
-Thresholds, cooldowns, persistence counters, drain mode, escalation state, and initial-limit bootstrap all remain private
-state inside `EngineLoadConcurrencyPolicy`. Porting that algorithm does not require another controller abstraction.
+Thresholds, cooldowns, persistence counters, drain mode, and escalation state remain private state inside
+`EngineLoadConcurrencyPolicy`. V1 starts from the configured `initial_limit`; capacity-derived bootstrap is not needed
+to make adaptation useful and remains a possible follow-up.
 
 ## Follow-up integration work
 
-1. Implement and test `EngineLoadConcurrencyPolicy` against recorded vLLM metric traces.
-2. Extend `VLLMMetricsScraper` to construct coherent `engine.loads` snapshots.
-3. Add per-episode child tasks, an in-flight registry, and cancellation accounting for fully async trajectory shedding.
-4. Add a database migration/recovery policy suitable for deployments that run more than one `TinkerEngine`; the first
-   integration deliberately preserves SkyRL's current single-engine ownership model.
+1. Add per-episode child tasks, an in-flight registry, and cancellation accounting for fully async trajectory shedding.
+2. Add P/D role attribution before allowing `engine_load` with disaggregated prefill/decode servers.
+3. Decide whether custom generators that bypass `RemoteInferenceClient.generate()` need an admission-aware OpenAI
+   transport or a proxy-level gate, based on actual users of those integrations.
+
+Distributed controller ownership is intentionally deferred because SkyRL currently has one process owning native
+generation admission and one `TinkerEngine` owning durable dispatch. Train/eval fairness and remote backend model
+lifecycle are existing, separate concerns rather than requirements for adaptive request admission.

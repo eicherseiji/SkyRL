@@ -6,6 +6,7 @@ from skyrl.utils.adaptive_concurrency import (
     ConcurrencyContext,
     ConcurrencyDecision,
     ConcurrencyPolicy,
+    EngineLoadConcurrencyPolicy,
     FixedConcurrencyPolicy,
     QueueDelayConcurrencyPolicy,
     RequestSamplingFeedback,
@@ -340,6 +341,126 @@ def test_feedback_accepts_a_coherent_engine_load_snapshot():
 
     assert feedback.engine_loads == loads
     assert feedback.metrics["engine.loads"][0]["engine_id"] == "decode-0"
+
+
+def engine_feedback(
+    *,
+    kv_usage: float,
+    running: int = 8,
+    waiting: int = 0,
+    waiting_capacity: int | None = None,
+    preemptions_delta: int = 0,
+    role: str | None = "decode",
+) -> VLLMEngineSamplingFeedback:
+    return VLLMEngineSamplingFeedback(
+        engine_loads=(
+            VLLMEngineLoad(
+                engine_id="engine-0",
+                role=role,
+                kv_capacity_tokens=131_072,
+                max_model_len=32_768,
+                kv_usage=kv_usage,
+                running=running,
+                waiting=waiting,
+                waiting_capacity=waiting_capacity,
+                preemptions_delta=preemptions_delta,
+            ),
+        )
+    )
+
+
+def test_engine_load_policy_soft_trims_kv_pressure_without_shedding():
+    policy = EngineLoadConcurrencyPolicy(min_limit=1, max_limit=128)
+
+    decision = policy.on_feedback(
+        engine_feedback(kv_usage=0.85),
+        context(current_limit=100, in_flight=90),
+    )
+
+    assert decision == ConcurrencyDecision(desired_limit=74, reason="kv_soft_trim")
+
+
+def test_engine_load_policy_v1_hard_trim_still_drains_without_active_shedding():
+    policy = EngineLoadConcurrencyPolicy(min_limit=1, max_limit=128)
+
+    decision = policy.on_feedback(
+        engine_feedback(kv_usage=0.91),
+        context(current_limit=100, in_flight=90),
+    )
+
+    assert decision == ConcurrencyDecision(desired_limit=69, shed_count=0, reason="kv_hard_trim")
+
+
+def test_engine_load_policy_can_express_hard_shedding_for_a_future_task_owner():
+    policy = EngineLoadConcurrencyPolicy(min_limit=1, max_limit=128, enable_active_shedding=True)
+
+    decision = policy.on_feedback(
+        engine_feedback(kv_usage=0.91),
+        context(current_limit=100, in_flight=90),
+    )
+
+    assert decision == ConcurrencyDecision(desired_limit=69, shed_count=21, reason="kv_hard_trim")
+
+
+def test_engine_load_policy_cuts_on_preemption_and_persistent_capacity_queue():
+    preemption_policy = EngineLoadConcurrencyPolicy(min_limit=1, max_limit=128)
+    preemption = preemption_policy.on_feedback(
+        engine_feedback(kv_usage=0.5, preemptions_delta=1),
+        context(current_limit=100, in_flight=100),
+    )
+    assert preemption == ConcurrencyDecision(desired_limit=80, reason="engine_preemptions")
+
+    queue_policy = EngineLoadConcurrencyPolicy(min_limit=1, max_limit=128)
+    for _ in range(queue_policy.QUEUE_PERSISTENCE_POLLS - 1):
+        assert (
+            queue_policy.on_feedback(
+                engine_feedback(kv_usage=0.5, running=10, waiting=6, waiting_capacity=6),
+                context(current_limit=100, in_flight=100),
+            )
+            is None
+        )
+    queue = queue_policy.on_feedback(
+        engine_feedback(kv_usage=0.5, running=10, waiting=6, waiting_capacity=6),
+        context(current_limit=100, in_flight=100),
+    )
+    assert queue == ConcurrencyDecision(desired_limit=90, reason="engine_queue_overload")
+
+
+def test_engine_load_policy_grows_by_turnover_only_while_recent_scrape_is_clear():
+    policy = EngineLoadConcurrencyPolicy(min_limit=1, max_limit=16)
+    clear_context = ConcurrencyContext(current_limit=4, in_flight=4, observed_at_s=100.0)
+    assert policy.on_feedback(engine_feedback(kv_usage=0.5), clear_context) is None
+
+    decision = None
+    for offset in range(5):
+        decision = policy.on_completion(
+            SamplingCompletion(tokens=100, duration_s=1),
+            ConcurrencyContext(current_limit=4, in_flight=3, observed_at_s=101.0 + offset),
+        )
+    assert decision == ConcurrencyDecision(desired_limit=5, reason="clear_engine_turnover")
+
+    stale_policy = EngineLoadConcurrencyPolicy(min_limit=1, max_limit=16)
+    assert stale_policy.on_feedback(engine_feedback(kv_usage=0.5), clear_context) is None
+    assert (
+        stale_policy.on_completion(
+            SamplingCompletion(tokens=100, duration_s=1),
+            ConcurrencyContext(current_limit=4, in_flight=3, observed_at_s=116.0),
+        )
+        is None
+    )
+
+
+def test_engine_load_policy_ignores_request_feedback_and_prefill_only_load():
+    policy = EngineLoadConcurrencyPolicy(min_limit=1, max_limit=16)
+
+    assert policy.on_feedback(RequestSamplingFeedback(request_latency_s=1), context(current_limit=4)) is None
+    assert (
+        policy.on_feedback(
+            engine_feedback(kv_usage=0.99, preemptions_delta=3, role="prefill"),
+            context(current_limit=4),
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
