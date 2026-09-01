@@ -1,4 +1,4 @@
-"""Selection policies for shedding in-flight trajectory groups."""
+"""Selection policies for shedding in-flight trajectories."""
 
 from dataclasses import dataclass
 from typing import Protocol, Sequence, runtime_checkable
@@ -7,56 +7,46 @@ from skyrl.train.generators.base import TrainingPhase
 
 
 @dataclass(frozen=True)
-class TrajectoryGroupCancellationCandidate:
-    """A cancellable prompt group owned by a generator.
+class TrajectoryCancellationCandidate:
+    """One cancellable trajectory attempt owned by a generator."""
 
-    ``active_trajectory_count`` is the number of live repetitions in the
-    group. A selection always cancels the whole group, even when doing so
-    exceeds the requested trajectory count.
-    """
-
-    group_id: str
+    task_id: str
+    group_id: str | None
+    repetition_id: int | None
     started_at_s: float
-    active_trajectory_count: int
     training_phase: TrainingPhase | None
 
 
 @runtime_checkable
-class TrajectoryGroupCancellationPolicy(Protocol):
-    """Select complete prompt groups for a requested amount of shedding."""
+class TrajectoryCancellationPolicy(Protocol):
+    """Select individual trajectory attempts for adaptive shedding."""
 
-    def select_groups(
+    def select_trajectories(
         self,
-        candidates: Sequence[TrajectoryGroupCancellationCandidate],
+        candidates: Sequence[TrajectoryCancellationCandidate],
         shed_count: int,
     ) -> Sequence[str]: ...
 
 
-class YoungestTrainingGroupCancellationPolicy:
-    """Cancel the newest training groups until ``shed_count`` is covered.
+class YoungestTrainingTrajectoryCancellationPolicy:
+    """Cancel at most ``shed_count`` of the newest training trajectories.
 
-    Evaluation groups are deliberately excluded. They still share sampling
+    Evaluation trajectories are deliberately excluded. They still share sampling
     admission and therefore drain behind a lower limit, but adaptive training
     pressure does not repeatedly throw away evaluation results.
     """
 
-    def select_groups(
+    def select_trajectories(
         self,
-        candidates: Sequence[TrajectoryGroupCancellationCandidate],
+        candidates: Sequence[TrajectoryCancellationCandidate],
         shed_count: int,
     ) -> Sequence[str]:
         if shed_count <= 0:
             return ()
 
-        selected: list[str] = []
-        selected_trajectories = 0
-        for candidate in sorted(
+        newest_first = sorted(
             (candidate for candidate in candidates if candidate.training_phase == "train"),
             key=lambda candidate: candidate.started_at_s,
             reverse=True,
-        ):
-            selected.append(candidate.group_id)
-            selected_trajectories += candidate.active_trajectory_count
-            if selected_trajectories >= shed_count:
-                break
-        return tuple(selected)
+        )
+        return tuple(candidate.task_id for candidate in newest_first[:shed_count])

@@ -33,9 +33,9 @@ from skyrl.train.generators.base import (
     TrajectoryID,
 )
 from skyrl.train.generators.trajectory_cancellation import (
-    TrajectoryGroupCancellationCandidate,
-    TrajectoryGroupCancellationPolicy,
-    YoungestTrainingGroupCancellationPolicy,
+    TrajectoryCancellationCandidate,
+    TrajectoryCancellationPolicy,
+    YoungestTrainingTrajectoryCancellationPolicy,
 )
 from skyrl.train.generators.utils import (
     apply_overlong_filtering,
@@ -89,19 +89,16 @@ class StepWiseOutput:
 
 
 @dataclass
-class _ActiveTrajectoryGroup:
-    """One cancellable attempt at producing a complete prompt group."""
+class _ActiveTrajectory:
+    """One cancellable attempt at producing a trajectory."""
 
-    registry_id: str
-    logical_group_id: str
+    task_id: str
+    group_id: str | None
+    repetition_id: int | None
     training_phase: TrainingPhase | None
     started_at_s: float
-    tasks: List[asyncio.Task[Union[TrajectoryOutput, StepWiseOutput]]]
+    task: asyncio.Task[Union[TrajectoryOutput, StepWiseOutput]]
     shed_reason: Optional[str] = None
-
-    @property
-    def active_trajectory_count(self) -> int:
-        return sum(not task.done() for task in self.tasks)
 
 
 @dataclass
@@ -175,7 +172,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         tokenizer,
         policy_model_name: Optional[str] = None,
         sampling_concurrency_controller: Optional[SamplingConcurrencyController] = None,
-        trajectory_cancellation_policy: Optional[TrajectoryGroupCancellationPolicy] = None,
+        trajectory_cancellation_policy: Optional[TrajectoryCancellationPolicy] = None,
     ):
         """
         Args:
@@ -190,19 +187,19 @@ class SkyRLGymGenerator(GeneratorInterface):
             sampling_concurrency_controller: Optional custom controller. When
                 omitted and ``generator.sampling_concurrency.enabled`` is true,
                 the generator constructs the configured built-in controller.
-            trajectory_cancellation_policy: Selects complete training prompt
-                groups when a concurrency decision requests active shedding.
+            trajectory_cancellation_policy: Selects individual training
+                trajectories when a concurrency decision requests shedding.
         """
         self.generator_cfg = generator_cfg
         self.skyrl_gym_cfg = skyrl_gym_cfg
         self.inference_engine_client = inference_engine_client
         self.tokenizer = tokenizer
         self.policy_model_name = policy_model_name
-        self._active_trajectory_groups: Dict[str, _ActiveTrajectoryGroup] = {}
+        self._active_trajectories: Dict[str, _ActiveTrajectory] = {}
         self.trajectory_cancellation_policy = (
             trajectory_cancellation_policy
             if trajectory_cancellation_policy is not None
-            else YoungestTrainingGroupCancellationPolicy()
+            else YoungestTrainingTrajectoryCancellationPolicy()
         )
         self.sampling_concurrency_controller = sampling_concurrency_controller
         if self.sampling_concurrency_controller is None and generator_cfg.sampling_concurrency.enabled:
@@ -911,148 +908,127 @@ class SkyRLGymGenerator(GeneratorInterface):
         """Apply task-owner effects after the controller resizes admission."""
 
         if decision.shed_count > 0:
-            self.cancel_trajectory_groups(decision.shed_count, reason=decision.reason)
+            self.cancel_trajectories(decision.shed_count, reason=decision.reason)
 
-    def cancel_trajectory_groups(self, shed_count: int, *, reason: str) -> int:
-        """Cancel complete in-flight training groups selected by the configured policy.
+    def cancel_trajectories(self, shed_count: int, *, reason: str) -> int:
+        """Cancel selected in-flight training trajectories.
 
-        The return value is the number of live trajectory tasks asked to
-        cancel. It may exceed ``shed_count`` because prompt groups are atomic.
-        Cancelled groups are retried by :meth:`generate` behind the resized
-        request-admission limit.
+        Each cancelled trajectory is retried behind the resized request limit.
+        Its siblings continue uninterrupted, and :meth:`generate` still waits
+        for the complete prompt group before returning it to the trainer.
         """
 
         if shed_count <= 0:
             return 0
 
-        groups = tuple(self._active_trajectory_groups.values())
+        trajectories = tuple(self._active_trajectories.values())
         candidates = tuple(
-            TrajectoryGroupCancellationCandidate(
-                group_id=group.registry_id,
-                started_at_s=group.started_at_s,
-                active_trajectory_count=group.active_trajectory_count,
-                training_phase=group.training_phase,
+            TrajectoryCancellationCandidate(
+                task_id=trajectory.task_id,
+                group_id=trajectory.group_id,
+                repetition_id=trajectory.repetition_id,
+                started_at_s=trajectory.started_at_s,
+                training_phase=trajectory.training_phase,
             )
-            for group in groups
-            if group.shed_reason is None and group.active_trajectory_count > 0
+            for trajectory in trajectories
+            if trajectory.shed_reason is None and not trajectory.task.done()
         )
-        selected_ids = self.trajectory_cancellation_policy.select_groups(candidates, shed_count)
+        selected_ids = self.trajectory_cancellation_policy.select_trajectories(candidates, shed_count)
 
-        cancelled_trajectories = 0
-        cancelled_groups = 0
-        for registry_id in dict.fromkeys(selected_ids):
-            group = self._active_trajectory_groups.get(registry_id)
-            if group is None or group.shed_reason is not None:
+        cancelled = 0
+        for task_id in dict.fromkeys(selected_ids):
+            if cancelled >= shed_count:
+                break
+            trajectory = self._active_trajectories.get(task_id)
+            if trajectory is None or trajectory.shed_reason is not None or trajectory.task.done():
                 continue
-            active_tasks = [task for task in group.tasks if not task.done()]
-            if not active_tasks:
-                continue
-            group.shed_reason = reason
-            cancelled_groups += 1
-            cancelled_trajectories += len(active_tasks)
-            for task in active_tasks:
-                task.cancel()
+            trajectory.shed_reason = reason
+            trajectory.task.cancel()
+            cancelled += 1
 
-        if cancelled_groups:
+        if cancelled:
             logger.warning(
-                "Adaptive sampling requested shedding {} trajectories; cancelling {} live trajectories "
-                "across {} complete prompt groups (reason={})",
+                "Adaptive sampling requested shedding {} trajectories; cancelling {} trajectory attempts (reason={})",
                 shed_count,
-                cancelled_trajectories,
-                cancelled_groups,
+                cancelled,
                 reason,
             )
-        return cancelled_trajectories
+        return cancelled
 
-    @staticmethod
-    def _group_trajectory_indices(
-        trajectory_ids: Optional[List[TrajectoryID]],
-        count: int,
-    ) -> List[Tuple[str, List[int]]]:
-        """Group repetitions by prompt identity while preserving input order."""
-
-        grouped: Dict[str, List[int]] = {}
-        for index in range(count):
-            logical_group_id = trajectory_ids[index].instance_id if trajectory_ids is not None else f"prompt-{index}"
-            grouped.setdefault(logical_group_id, []).append(index)
-        return list(grouped.items())
-
-    async def _run_trajectory_group(
+    async def _run_trajectory(
         self,
         *,
-        logical_group_id: str,
-        indices: List[int],
+        index: int,
         input_batch: GeneratorInput,
         max_tokens: int,
         max_input_length: int,
         sampling_params: Optional[Dict[str, Any]],
         cache_salt: Optional[str],
         training_phase: TrainingPhase | None,
-    ) -> List[Tuple[int, Union[TrajectoryOutput, StepWiseOutput]]]:
-        """Run one prompt group, retrying an attempt shed by adaptive pressure."""
+    ) -> Tuple[int, Union[TrajectoryOutput, StepWiseOutput]]:
+        """Run one trajectory, retrying only this member when it is shed."""
 
         prompts = input_batch["prompts"]
         env_classes = input_batch["env_classes"]
         env_extras = input_batch["env_extras"]
         trajectory_ids = input_batch.get("trajectory_ids")
         assert env_extras is not None, "`env_extras` is required by SkyRLGymGenerator"
+        trajectory_id = trajectory_ids[index] if trajectory_ids is not None else None
+        group_id = trajectory_id.instance_id if trajectory_id is not None else None
+        repetition_id = trajectory_id.repetition_id if trajectory_id is not None else None
 
         attempt = 0
         while True:
-            registry_id = uuid4().hex
-            tasks = [
-                asyncio.create_task(
-                    self.agent_loop(
-                        prompts[index],
-                        env_classes[index],
-                        env_extras[index],
-                        max_tokens,
-                        max_input_length,
-                        sampling_params=sampling_params,
-                        trajectory_id=trajectory_ids[index] if trajectory_ids is not None else None,
-                        cache_salt=cache_salt,
-                    ),
-                    name=f"skyrl-trajectory-{logical_group_id}-{index}",
-                )
-                for index in indices
-            ]
-            group = _ActiveTrajectoryGroup(
-                registry_id=registry_id,
-                logical_group_id=logical_group_id,
+            task_id = uuid4().hex
+            task = asyncio.create_task(
+                self.agent_loop(
+                    prompts[index],
+                    env_classes[index],
+                    env_extras[index],
+                    max_tokens,
+                    max_input_length,
+                    sampling_params=sampling_params,
+                    trajectory_id=trajectory_id,
+                    cache_salt=cache_salt,
+                ),
+                name=f"skyrl-trajectory-{group_id or 'ungrouped'}-{repetition_id if repetition_id is not None else index}",
+            )
+            trajectory = _ActiveTrajectory(
+                task_id=task_id,
+                group_id=group_id,
+                repetition_id=repetition_id,
                 training_phase=training_phase,
                 started_at_s=time.monotonic(),
-                tasks=tasks,
+                task=task,
             )
-            self._active_trajectory_groups[registry_id] = group
+            self._active_trajectories[task_id] = trajectory
 
             try:
-                outputs = await asyncio.gather(*tasks)
-                return list(zip(indices, outputs))
+                return index, await task
             except asyncio.CancelledError:
                 current_task = asyncio.current_task()
                 owner_was_cancelled = bool(current_task is not None and current_task.cancelling())
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                if group.shed_reason is not None and not owner_was_cancelled:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                if trajectory.shed_reason is not None and not owner_was_cancelled:
                     attempt += 1
                     logger.info(
-                        "Retrying complete trajectory group {} after adaptive shedding (attempt={}, reason={})",
-                        logical_group_id,
+                        "Retrying trajectory group={} repetition={} after adaptive shedding (attempt={}, reason={})",
+                        group_id,
+                        repetition_id,
                         attempt,
-                        group.shed_reason,
+                        trajectory.shed_reason,
                     )
                     continue
                 raise
             except BaseException:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
                 raise
             finally:
-                self._active_trajectory_groups.pop(registry_id, None)
+                self._active_trajectories.pop(task_id, None)
 
     async def generate(self, input_batch: GeneratorInput, disable_tqdm: bool = False) -> GeneratorOutput:
         """
@@ -1086,7 +1062,6 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         batch_metadata = input_batch.get("batch_metadata")
         training_phase = batch_metadata.training_phase if batch_metadata is not None else None
-        trajectory_groups = self._group_trajectory_indices(trajectory_ids, len(prompts))
         progress = tqdm(
             total=len(prompts),
             desc="Generating Trajectories",
@@ -1095,10 +1070,9 @@ class SkyRLGymGenerator(GeneratorInterface):
             disable=disable_tqdm,
         )
 
-        async def run_group(logical_group_id: str, indices: List[int]):
-            outputs = await self._run_trajectory_group(
-                logical_group_id=logical_group_id,
-                indices=indices,
+        async def run_trajectory(index: int):
+            output = await self._run_trajectory(
+                index=index,
                 input_batch=input_batch,
                 max_tokens=max_tokens,
                 max_input_length=max_input_length,
@@ -1106,24 +1080,21 @@ class SkyRLGymGenerator(GeneratorInterface):
                 cache_salt=cache_salt,
                 training_phase=training_phase,
             )
-            progress.update(len(outputs))
-            return outputs
+            progress.update(1)
+            return output
 
-        group_tasks = [
-            asyncio.create_task(run_group(logical_group_id, indices)) for logical_group_id, indices in trajectory_groups
-        ]
+        trajectory_tasks = [asyncio.create_task(run_trajectory(index)) for index in range(len(prompts))]
         try:
-            grouped_outputs = await asyncio.gather(*group_tasks)
+            indexed_outputs = await asyncio.gather(*trajectory_tasks)
         except BaseException:
-            for task in group_tasks:
+            for task in trajectory_tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(*group_tasks, return_exceptions=True)
+            await asyncio.gather(*trajectory_tasks, return_exceptions=True)
             raise
         finally:
             progress.close()
 
-        indexed_outputs = [item for group_outputs in grouped_outputs for item in group_outputs]
         all_outputs = [output for _, output in sorted(indexed_outputs, key=lambda item: item[0])]
         # Per-trajectory end-to-end generation times (one entry per prompt, preserving input order).
         # ``e2e_time`` is optional for agent loops; if any trajectory did not record it, we omit the

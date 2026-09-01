@@ -2,9 +2,9 @@ from .base import GeneratorInput, GeneratorInterface, GeneratorOutput
 from .skyrl_gym_generator import SkyRLGymGenerator
 from .skyrl_vlm_generator import SkyRLVLMGymGenerator
 from .trajectory_cancellation import (
-    TrajectoryGroupCancellationCandidate,
-    TrajectoryGroupCancellationPolicy,
-    YoungestTrainingGroupCancellationPolicy,
+    TrajectoryCancellationCandidate,
+    TrajectoryCancellationPolicy,
+    YoungestTrainingTrajectoryCancellationPolicy,
 )
 
 __all__ = [
@@ -13,7 +13,7 @@ __all__ = [
     "GeneratorOutput",
     "SkyRLGymGenerator",
     "SkyRLVLMGymGenerator",
-    "TrajectoryGroupCancellationCandidate",
-    "TrajectoryGroupCancellationPolicy",
-    "YoungestTrainingGroupCancellationPolicy",
+    "TrajectoryCancellationCandidate",
+    "TrajectoryCancellationPolicy",
+    "YoungestTrainingTrajectoryCancellationPolicy",
 ]

@@ -302,8 +302,7 @@ class ConcurrencyDecision:
     """Effects requested by a policy and applied by the admission owner.
 
     ``desired_limit`` uses sampled-sequence admission units. ``shed_count`` is
-    a target number of owner-managed trajectories to cancel. An owner may
-    cancel more when its correctness boundary is a complete prompt group.
+    the maximum number of owner-managed trajectory attempts to cancel.
     """
 
     desired_limit: int

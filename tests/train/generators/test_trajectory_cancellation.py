@@ -11,8 +11,8 @@ from skyrl.train.generators.skyrl_gym_generator import (
     TrajectoryOutput,
 )
 from skyrl.train.generators.trajectory_cancellation import (
-    TrajectoryGroupCancellationCandidate,
-    YoungestTrainingGroupCancellationPolicy,
+    TrajectoryCancellationCandidate,
+    YoungestTrainingTrajectoryCancellationPolicy,
 )
 from skyrl.utils.adaptive_concurrency import (
     ConcurrencyDecision,
@@ -49,20 +49,20 @@ def _tokenizer() -> MagicMock:
     return tokenizer
 
 
-def test_youngest_group_policy_selects_atomic_training_groups_only():
-    policy = YoungestTrainingGroupCancellationPolicy()
+def test_youngest_trajectory_policy_selects_exact_count_and_excludes_eval():
+    policy = YoungestTrainingTrajectoryCancellationPolicy()
     candidates = [
-        TrajectoryGroupCancellationCandidate("old", 1.0, 4, "train"),
-        TrajectoryGroupCancellationCandidate("eval", 3.0, 8, "eval"),
-        TrajectoryGroupCancellationCandidate("young", 2.0, 4, "train"),
+        TrajectoryCancellationCandidate("old", "group-a", 0, 1.0, "train"),
+        TrajectoryCancellationCandidate("eval", "group-eval", 0, 3.0, "eval"),
+        TrajectoryCancellationCandidate("young", "group-b", 1, 2.0, "train"),
     ]
 
-    assert policy.select_groups(candidates, shed_count=1) == ("young",)
-    assert policy.select_groups(candidates, shed_count=5) == ("young", "old")
+    assert policy.select_trajectories(candidates, shed_count=1) == ("young",)
+    assert policy.select_trajectories(candidates, shed_count=5) == ("young", "old")
 
 
 @pytest.mark.asyncio
-async def test_generator_cancels_and_retries_the_complete_youngest_prompt_group():
+async def test_generator_cancels_and_retries_only_one_youngest_trajectory():
     controller = SamplingConcurrencyController(policy=_SheddingPolicy(), initial_limit=4)
     inference_client = MagicMock()
     inference_client.set_sampling_concurrency_controller.return_value = True
@@ -78,17 +78,18 @@ async def test_generator_cancels_and_retries_the_complete_youngest_prompt_group(
 
     release = asyncio.Event()
     all_started = asyncio.Event()
-    starts: list[str] = []
-    cancelled: list[str] = []
+    starts: list[tuple[str, int]] = []
+    cancelled: list[tuple[str, int]] = []
 
     async def agent_loop(*args, trajectory_id, **kwargs):
-        starts.append(trajectory_id.instance_id)
+        identity = (trajectory_id.instance_id, trajectory_id.repetition_id)
+        starts.append(identity)
         if len(starts) >= 4:
             all_started.set()
         try:
             await release.wait()
         except asyncio.CancelledError:
-            cancelled.append(trajectory_id.instance_id)
+            cancelled.append(identity)
             raise
         return TrajectoryOutput(
             response_ids=[trajectory_id.repetition_id + 10],
@@ -119,16 +120,23 @@ async def test_generator_cancels_and_retries_the_complete_youngest_prompt_group(
     await asyncio.wait_for(all_started.wait(), timeout=1)
     await controller.on_feedback(SamplingFeedback())
 
-    async def young_group_restarted():
-        while Counter(starts)["young"] < 4:
+    async def one_young_trajectory_restarted():
+        while sum(group == "young" for group, _ in starts) < 3:
             await asyncio.sleep(0)
 
-    await asyncio.wait_for(young_group_restarted(), timeout=1)
+    await asyncio.wait_for(one_young_trajectory_restarted(), timeout=1)
     release.set()
     output = await asyncio.wait_for(generation, timeout=1)
 
-    assert cancelled == ["young", "young"]
-    assert Counter(starts) == Counter({"young": 4, "old": 2})
+    assert cancelled == [("young", 1)]
+    assert Counter(starts) == Counter(
+        {
+            ("old", 0): 1,
+            ("old", 1): 1,
+            ("young", 0): 1,
+            ("young", 1): 2,
+        }
+    )
     assert output["response_ids"] == [[10], [11], [10], [11]]
 
 
