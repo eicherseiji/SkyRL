@@ -1218,10 +1218,48 @@ class InferenceEngineConfig(BaseConfig):
 
 
 @dataclass
+class SamplingConcurrencyConfig(BaseConfig):
+    """Opt-in sampling admission shared by training and evaluation rollouts."""
+
+    enabled: bool = False
+    """Enable the resizable sampling limiter. Disabled preserves the existing static semaphore."""
+    policy: Literal["fixed", "queue_delay", "engine_load"] = "fixed"
+    """Built-in policy. ``engine_load`` consumes managed vLLM KV, queue, and preemption metrics."""
+    initial_limit: int = 8
+    """Initial number of sampled sequences admitted to generation."""
+    min_limit: int = 1
+    max_limit: int = 256
+    queue_duration_target_s: float = 0.5
+    """Target backend queue duration in seconds for the queue-delay AIMD policy."""
+    adjustment_interval: int = 32
+    additive_step: int = 1
+    decrease_ratio: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.min_limit < 1:
+            raise ValueError(f"generator.sampling_concurrency.min_limit must be at least 1, got {self.min_limit}")
+        if not self.min_limit <= self.initial_limit <= self.max_limit:
+            raise ValueError(
+                "generator.sampling_concurrency.initial_limit must be between "
+                f"min_limit ({self.min_limit}) and max_limit ({self.max_limit}), got {self.initial_limit}"
+            )
+        if self.queue_duration_target_s < 0:
+            raise ValueError("generator.sampling_concurrency.queue_duration_target_s must be non-negative")
+        if self.adjustment_interval < 1:
+            raise ValueError("generator.sampling_concurrency.adjustment_interval must be at least 1")
+        if self.additive_step < 1:
+            raise ValueError("generator.sampling_concurrency.additive_step must be at least 1")
+        if not 0 < self.decrease_ratio < 1:
+            raise ValueError("generator.sampling_concurrency.decrease_ratio must be between 0 and 1")
+
+
+@dataclass
 class GeneratorConfig(BaseConfig):
     """Configuration for generation behavior."""
 
     inference_engine: InferenceEngineConfig = field(default_factory=InferenceEngineConfig)
+    sampling_concurrency: SamplingConcurrencyConfig = field(default_factory=SamplingConcurrencyConfig)
+    """Resizable sampling admission. The same limiter covers train and eval requests."""
     n_samples_per_prompt: int = 5
     """Number of samples to generate per prompt.
     The total size of the training batch is ``trainer.train_batch_size * n_samples_per_prompt``."""

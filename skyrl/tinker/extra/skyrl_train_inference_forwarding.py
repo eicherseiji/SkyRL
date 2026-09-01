@@ -5,6 +5,7 @@ Pair to :class:`ExternalInferenceClient`; resolves the target URL from
 """
 
 import asyncio
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -15,15 +16,26 @@ from skyrl.backends.utils import convert_vllm_prompt_logprobs
 from skyrl.tinker import types
 from skyrl.tinker.config import EngineConfig
 from skyrl.tinker.db_models import EngineStateDB, FutureDB, RequestStatus
+from skyrl.utils.adaptive_concurrency import (
+    RequestSamplingFeedback,
+    SamplingCompletion,
+    SamplingConcurrencyController,
+)
 from skyrl.utils.log import logger
 
 
 class SkyRLTrainInferenceForwardingClient:
     """Forwards EXTERNAL sample requests to the SkyRL-Train-managed vLLM."""
 
-    def __init__(self, engine_config: EngineConfig, db_engine):
+    def __init__(
+        self,
+        engine_config: EngineConfig,
+        db_engine,
+        sampling_concurrency_controller: SamplingConcurrencyController | None = None,
+    ):
         self.engine_config = engine_config
         self.db_engine = db_engine
+        self.sampling_concurrency_controller = sampling_concurrency_controller
         self._cached_proxy_url: str | None = None
         self._cache_lock = asyncio.Lock()
         # Backpressure layered: httpx pool -> vllm-router -> vLLM max_num_seqs.
@@ -72,14 +84,40 @@ class SkyRLTrainInferenceForwardingClient:
         base_model: str | None = None,
     ):
         """Forward a sample request to vLLM and write the result to FutureDB."""
+        started_at = time.monotonic()
+        completion_tokens = 0
+        prompt_tokens = 0
         try:
-            result = await self._forward_with_retry(sample_req, model_id, base_model=base_model)
+            if self.sampling_concurrency_controller is None:
+                result, prompt_tokens = await self._forward_with_retry(sample_req, model_id, base_model=base_model)
+            else:
+                async with self.sampling_concurrency_controller.slot(units=sample_req.num_samples):
+                    result, prompt_tokens = await self._forward_with_retry(sample_req, model_id, base_model=base_model)
+            completion_tokens = sum(len(sequence.tokens) for sequence in result.sequences)
             result_data = result.model_dump()
             status = RequestStatus.COMPLETED
         except Exception as e:
             logger.exception("Backend-forwarded sample failed (request_id=%s)", request_id)
             result_data = {"error": str(e), "status": "failed"}
             status = RequestStatus.FAILED
+
+        if self.sampling_concurrency_controller is not None:
+            duration_s = time.monotonic() - started_at
+            await self.sampling_concurrency_controller.on_feedback(
+                RequestSamplingFeedback(
+                    source="tinker",
+                    request_latency_s=duration_s,
+                    prompt_tokens=prompt_tokens or None,
+                    completion_tokens=completion_tokens,
+                )
+            )
+            await self.sampling_concurrency_controller.on_completion(
+                SamplingCompletion(
+                    tokens=completion_tokens,
+                    duration_s=duration_s,
+                    admission_units=sample_req.num_samples,
+                )
+            )
 
         async with AsyncSession(self.db_engine) as session:
             future = await session.get(FutureDB, request_id)
@@ -93,7 +131,9 @@ class SkyRLTrainInferenceForwardingClient:
             future.completed_at = datetime.now(timezone.utc)
             await session.commit()
 
-    async def _forward_with_retry(self, sample_req, model_id: str, *, base_model: str | None) -> types.SampleOutput:
+    async def _forward_with_retry(
+        self, sample_req, model_id: str, *, base_model: str | None
+    ) -> tuple[types.SampleOutput, int]:
         # httpx.RequestError covers ConnectError, ReadError, TimeoutException, etc.
         # HTTP 4xx/5xx surfaces as RuntimeError below and is NOT retried.
         try:
@@ -111,12 +151,12 @@ class SkyRLTrainInferenceForwardingClient:
 
     async def _forward(
         self, proxy_url: str, sample_req, model_id: str, *, base_model: str | None
-    ) -> types.SampleOutput:
+    ) -> tuple[types.SampleOutput, int]:
         # model_id matches the LoRA name registered with vLLM during
         # save_weights_for_sampler; base_model is used for non-LoRA sampling.
         model_name = base_model if base_model else model_id
 
-        model_input = sample_req.prompt.to_types()
+        model_input = sample_req.prompt.to_types() if hasattr(sample_req.prompt, "to_types") else sample_req.prompt
         prompt_tokens = render_model_input([model_input])[0].prompt_ids
 
         sp = sample_req.sampling_params
@@ -142,11 +182,17 @@ class SkyRLTrainInferenceForwardingClient:
             payload["prompt_logprobs"] = topk_prompt_logprobs
         # SamplingParams.stop is polymorphic (list[str] | list[int]).
         stop = getattr(sp, "stop", None)
+        stop_tokens = getattr(sp, "stop_tokens", None)
+        stop_strings = getattr(sp, "stop_strings", None)
         if stop:
             if all(isinstance(s, int) for s in stop):
-                payload["stop_token_ids"] = list(stop)
+                stop_tokens = list(stop)
             elif all(isinstance(s, str) for s in stop):
-                payload["stop"] = list(stop)
+                stop_strings = list(stop)
+        if stop_tokens:
+            payload["stop_token_ids"] = list(stop_tokens)
+        elif stop_strings:
+            payload["stop"] = list(stop_strings)
 
         # Pass X-Session-ID for deterministic routing
         headers = {}
@@ -199,8 +245,11 @@ class SkyRLTrainInferenceForwardingClient:
                 )
             )
 
-        return types.SampleOutput(
-            sequences=sequences,
-            prompt_logprobs=prompt_logprobs,
-            topk_prompt_logprobs=topk,
+        return (
+            types.SampleOutput(
+                sequences=sequences,
+                prompt_logprobs=prompt_logprobs,
+                topk_prompt_logprobs=topk,
+            ),
+            len(prompt_tokens),
         )

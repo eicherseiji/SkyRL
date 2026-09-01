@@ -4,9 +4,32 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Literal
 
 from cloudpathlib import AnyPath
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class SamplingConcurrencyConfig(BaseModel):
+    """Admission settings for Tinker's durable sampling queue."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    policy: Literal["fixed", "queue_delay"] = "fixed"
+    initial_limit: int = Field(default=8, ge=1)
+    min_limit: int = Field(default=1, ge=1)
+    max_limit: int = Field(default=256, ge=1)
+    queue_duration_target_s: float = Field(default=0.5, ge=0)
+    adjustment_interval: int = Field(default=32, ge=1)
+    additive_step: int = Field(default=1, ge=1)
+    decrease_ratio: float = Field(default=0.5, gt=0, lt=1)
+
+    @model_validator(mode="after")
+    def validate_limits(self) -> "SamplingConcurrencyConfig":
+        if not self.min_limit <= self.initial_limit <= self.max_limit:
+            raise ValueError("initial_limit must be between min_limit and max_limit")
+        return self
 
 
 class EngineConfig(BaseModel):
@@ -32,7 +55,17 @@ class EngineConfig(BaseModel):
     )
     external_inference_url: str | None = Field(
         default=None,
-        description="URL of the external inference engine. If set, sample requests will be sent to the external engine instead (currently only VLLM is supported).",
+        description=(
+            "Base URL of the external inference engine. If set, sample requests "
+            "will be sent to a vLLM or Fireworks completions endpoint."
+        ),
+        json_schema_extra={"argparse_type": str},
+    )
+    external_inference_provider: Literal["vllm", "fireworks"] = Field(
+        default="vllm",
+        description=(
+            "External inference response format. Fireworks enables typed pressure feedback from response headers."
+        ),
         json_schema_extra={"argparse_type": str},
     )
     external_inference_api_key: str = Field(
@@ -57,6 +90,11 @@ class EngineConfig(BaseModel):
             "file descriptors). Set an int to enforce a per-API-process cap."
         ),
         json_schema_extra={"argparse_type": lambda v: None if v == "None" else int(v)},
+    )
+    sampling_concurrency: SamplingConcurrencyConfig = Field(
+        default_factory=SamplingConcurrencyConfig,
+        description="Opt-in durable sample admission and adaptive concurrency settings.",
+        json_schema_extra={"argparse_type": json.loads},
     )
     session_cleanup_interval_sec: int = Field(
         default=60,
@@ -129,17 +167,17 @@ def add_model(parser: argparse.ArgumentParser, model: type[BaseModel]) -> None:
 def config_to_argv(cfg: BaseModel) -> list[str]:
     """This should 'unparse' a config parsed by an ArgumentParser constructed by add_model."""
     argv = []
-    for field_name, value in cfg.model_dump().items():
-        field = cfg.model_fields[field_name]
+    for field_name, field in type(cfg).model_fields.items():
+        value = getattr(cfg, field_name)
         arg_name = field_name.replace("_", "-")
 
         if field.annotation is bool:
             argv.append(f"--{arg_name}" if value else f"--no-{arg_name}")
-        elif field.annotation is dict:
+        elif field.annotation is dict or isinstance(value, BaseModel):
             # Serialize dict to JSON string
             if value:
                 argv.append(f"--{arg_name}")
-                argv.append(json.dumps(value))
+                argv.append(json.dumps(value.model_dump() if isinstance(value, BaseModel) else value))
         else:
             # Skip None values - let them use defaults or environment variables
             if value is not None:

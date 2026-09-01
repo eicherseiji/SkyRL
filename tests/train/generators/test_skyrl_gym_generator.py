@@ -16,6 +16,7 @@ from skyrl.train.generators.base import (
     GeneratorOutput,
 )
 from skyrl.train.generators.skyrl_gym_generator import SkyRLGymGenerator, TurnOutput
+from skyrl.utils.adaptive_concurrency import EngineLoadConcurrencyPolicy
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
 
 # Mock constants, where 4 is the eos token id
@@ -140,6 +141,87 @@ def mock_env_cfg():
     cfg.max_env_workers = 0
     cfg.env_class = "gsm8k"
     return cfg
+
+
+def test_generator_owns_and_attaches_configured_sampling_controller(
+    mock_tokenizer, mock_llm, generator_cfg, mock_env_cfg
+):
+    generator_cfg.sampling_concurrency.enabled = True
+    generator_cfg.sampling_concurrency.initial_limit = 3
+    mock_llm.set_sampling_concurrency_controller.return_value = True
+
+    generator = SkyRLGymGenerator(
+        generator_cfg=generator_cfg,
+        skyrl_gym_cfg=mock_env_cfg,
+        inference_engine_client=mock_llm,
+        tokenizer=mock_tokenizer,
+    )
+
+    controller = generator.sampling_concurrency_controller
+    assert controller is not None
+    assert controller.current_limit == 3
+    mock_llm.set_sampling_concurrency_controller.assert_called_once_with(controller)
+
+
+def test_generator_builds_engine_load_policy(mock_tokenizer, mock_llm, generator_cfg, mock_env_cfg):
+    generator_cfg.sampling_concurrency.enabled = True
+    generator_cfg.sampling_concurrency.policy = "engine_load"
+    generator_cfg.batched = False
+    mock_llm.set_sampling_concurrency_controller.return_value = True
+
+    generator = SkyRLGymGenerator(
+        generator_cfg=generator_cfg,
+        skyrl_gym_cfg=mock_env_cfg,
+        inference_engine_client=mock_llm,
+        tokenizer=mock_tokenizer,
+    )
+
+    assert isinstance(generator.sampling_concurrency_controller.policy, EngineLoadConcurrencyPolicy)
+    assert generator.sampling_concurrency_controller.policy.enable_active_shedding is True
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("run_engines_locally", "requires SkyRL-managed local vLLM"),
+        ("enable_ray_prometheus_stats", "requires.*enable_ray_prometheus_stats"),
+        ("enable_pd", "does not yet support prefill/decode"),
+    ],
+)
+def test_generator_rejects_engine_load_without_coherent_managed_vllm_metrics(
+    mock_tokenizer, mock_llm, generator_cfg, mock_env_cfg, field, message
+):
+    generator_cfg.sampling_concurrency.enabled = True
+    generator_cfg.sampling_concurrency.policy = "engine_load"
+    if field == "run_engines_locally":
+        generator_cfg.inference_engine.run_engines_locally = False
+    elif field == "enable_ray_prometheus_stats":
+        generator_cfg.inference_engine.enable_ray_prometheus_stats = False
+    else:
+        generator_cfg.inference_engine.enable_pd = True
+
+    with pytest.raises(ValueError, match=message):
+        SkyRLGymGenerator(
+            generator_cfg=generator_cfg,
+            skyrl_gym_cfg=mock_env_cfg,
+            inference_engine_client=mock_llm,
+            tokenizer=mock_tokenizer,
+        )
+
+
+def test_generator_rejects_enabled_admission_for_client_without_request_gate(
+    mock_tokenizer, mock_llm, generator_cfg, mock_env_cfg
+):
+    generator_cfg.sampling_concurrency.enabled = True
+    mock_llm.set_sampling_concurrency_controller.return_value = False
+
+    with pytest.raises(ValueError, match="does not support per-request sampling admission"):
+        SkyRLGymGenerator(
+            generator_cfg=generator_cfg,
+            skyrl_gym_cfg=mock_env_cfg,
+            inference_engine_client=mock_llm,
+            tokenizer=mock_tokenizer,
+        )
 
 
 def validate_generator_input(input_batch: GeneratorInput) -> bool:

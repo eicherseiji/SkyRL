@@ -29,13 +29,26 @@ from skyrl.train.generators.base import (
     GeneratorInput,
     GeneratorInterface,
     GeneratorOutput,
+    TrainingPhase,
     TrajectoryID,
+)
+from skyrl.train.generators.trajectory_cancellation import (
+    TrajectoryCancellationCandidate,
+    TrajectoryCancellationPolicy,
+    YoungestTrainingTrajectoryCancellationPolicy,
 )
 from skyrl.train.generators.utils import (
     apply_overlong_filtering,
     get_custom_chat_template,
     get_generation_prompt_ids,
     get_rollout_metrics,
+)
+from skyrl.utils.adaptive_concurrency import (
+    ConcurrencyDecision,
+    EngineLoadConcurrencyPolicy,
+    FixedConcurrencyPolicy,
+    QueueDelayConcurrencyPolicy,
+    SamplingConcurrencyController,
 )
 from skyrl_gym.envs.base_text_env import BaseTextEnvStepOutput
 
@@ -73,6 +86,19 @@ class StepWiseOutput:
     # Wall-clock seconds spent in each phase. "llm" is time in inference-engine calls, "env" is
     # time in env.step. Field is None if any loop did not record a split.
     time_splits: Optional[Dict[str, float]] = None
+
+
+@dataclass
+class _ActiveTrajectory:
+    """One cancellable attempt at producing a trajectory."""
+
+    task_id: str
+    group_id: str | None
+    repetition_id: int | None
+    training_phase: TrainingPhase | None
+    started_at_s: float
+    task: asyncio.Task[Union[TrajectoryOutput, StepWiseOutput]]
+    shed_reason: Optional[str] = None
 
 
 @dataclass
@@ -145,6 +171,8 @@ class SkyRLGymGenerator(GeneratorInterface):
         inference_engine_client: InferenceEngineInterface,
         tokenizer,
         policy_model_name: Optional[str] = None,
+        sampling_concurrency_controller: Optional[SamplingConcurrencyController] = None,
+        trajectory_cancellation_policy: Optional[TrajectoryCancellationPolicy] = None,
     ):
         """
         Args:
@@ -156,12 +184,77 @@ class SkyRLGymGenerator(GeneratorInterface):
                 into every ``client.generate(...)`` call as ``model``. When
                 ``None`` (default), the client falls back to its own
                 ``model_name``
+            sampling_concurrency_controller: Optional custom controller. When
+                omitted and ``generator.sampling_concurrency.enabled`` is true,
+                the generator constructs the configured built-in controller.
+            trajectory_cancellation_policy: Selects individual training
+                trajectories when a concurrency decision requests shedding.
         """
         self.generator_cfg = generator_cfg
         self.skyrl_gym_cfg = skyrl_gym_cfg
         self.inference_engine_client = inference_engine_client
         self.tokenizer = tokenizer
         self.policy_model_name = policy_model_name
+        self._active_trajectories: Dict[str, _ActiveTrajectory] = {}
+        self.trajectory_cancellation_policy = (
+            trajectory_cancellation_policy
+            if trajectory_cancellation_policy is not None
+            else YoungestTrainingTrajectoryCancellationPolicy()
+        )
+        self.sampling_concurrency_controller = sampling_concurrency_controller
+        if self.sampling_concurrency_controller is None and generator_cfg.sampling_concurrency.enabled:
+            concurrency_cfg = generator_cfg.sampling_concurrency
+            if concurrency_cfg.policy == "fixed":
+                policy = FixedConcurrencyPolicy()
+            elif concurrency_cfg.policy == "queue_delay":
+                policy = QueueDelayConcurrencyPolicy(
+                    min_limit=concurrency_cfg.min_limit,
+                    max_limit=concurrency_cfg.max_limit,
+                    queue_duration_target_s=concurrency_cfg.queue_duration_target_s,
+                    adjustment_interval=concurrency_cfg.adjustment_interval,
+                    additive_step=concurrency_cfg.additive_step,
+                    decrease_ratio=concurrency_cfg.decrease_ratio,
+                )
+            elif concurrency_cfg.policy == "engine_load":
+                if not generator_cfg.inference_engine.run_engines_locally:
+                    raise ValueError(
+                        "sampling concurrency policy 'engine_load' currently requires SkyRL-managed local vLLM engines"
+                    )
+                if not generator_cfg.inference_engine.enable_ray_prometheus_stats:
+                    raise ValueError(
+                        "sampling concurrency policy 'engine_load' requires "
+                        "generator.inference_engine.enable_ray_prometheus_stats=true"
+                    )
+                if generator_cfg.inference_engine.enable_pd:
+                    raise ValueError(
+                        "sampling concurrency policy 'engine_load' does not yet support prefill/decode "
+                        "role attribution"
+                    )
+                policy = EngineLoadConcurrencyPolicy(
+                    min_limit=concurrency_cfg.min_limit,
+                    max_limit=concurrency_cfg.max_limit,
+                    enable_active_shedding=not generator_cfg.batched,
+                )
+            else:  # Defensive for programmatic configs that bypass Literal validation.
+                raise ValueError(f"Unknown sampling concurrency policy: {concurrency_cfg.policy}")
+            self.sampling_concurrency_controller = SamplingConcurrencyController(
+                policy=policy,
+                initial_limit=concurrency_cfg.initial_limit,
+            )
+
+        if self.sampling_concurrency_controller is not None:
+            self.sampling_concurrency_controller.set_decision_handler(self._on_concurrency_decision)
+            attached = inference_engine_client.set_sampling_concurrency_controller(self.sampling_concurrency_controller)
+            if not attached:
+                raise ValueError(
+                    f"{type(inference_engine_client).__name__} does not support per-request sampling admission; "
+                    "override set_sampling_concurrency_controller() to opt in"
+                )
+            logger.info(
+                "Sampling concurrency enabled with policy={} and initial_limit={}",
+                type(self.sampling_concurrency_controller.policy).__name__,
+                self.sampling_concurrency_controller.current_limit,
+            )
         self.max_turns = generator_cfg.max_turns
         self.batched = generator_cfg.batched
         self.use_conversation_multi_turn = generator_cfg.use_conversation_multi_turn
@@ -319,6 +412,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         """
         agent_loop_start_time = time.monotonic()
         time_splits = {"llm": 0.0, "env": 0.0}
+        env = None
 
         session_id = (
             f"{trajectory_id.instance_id}_{trajectory_id.repetition_id}" if trajectory_id is not None else uuid4().hex
@@ -517,8 +611,6 @@ class SkyRLGymGenerator(GeneratorInterface):
 
             # Get environment-specific metrics after the episode is done
             env_metrics = env.get_metrics()
-            # Close the environment
-            await self._run_in_executor_if_available(env.close)
 
             prompt_ids = agent_loop_state.input_ids[:initial_prompt_length]
             rollout_logprobs = None
@@ -603,7 +695,11 @@ class SkyRLGymGenerator(GeneratorInterface):
             return agent_loop_output
 
         finally:
-            await self.inference_engine_client.finish_session(session_id)
+            try:
+                if env is not None:
+                    await self._run_in_executor_if_available(env.close)
+            finally:
+                await self.inference_engine_client.finish_session(session_id)
 
     def _build_per_token_rewards(
         self, per_step_rewards: List[Tuple[float, Optional[int]]], response_ids: List[int], appended_eos_token: bool
@@ -808,6 +904,132 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         return generator_output
 
+    def _on_concurrency_decision(self, decision: ConcurrencyDecision) -> None:
+        """Apply task-owner effects after the controller resizes admission."""
+
+        if decision.shed_count > 0:
+            self.cancel_trajectories(decision.shed_count, reason=decision.reason)
+
+    def cancel_trajectories(self, shed_count: int, *, reason: str) -> int:
+        """Cancel selected in-flight training trajectories.
+
+        Each cancelled trajectory is retried behind the resized request limit.
+        Its siblings continue uninterrupted, and :meth:`generate` still waits
+        for the complete prompt group before returning it to the trainer.
+        """
+
+        if shed_count <= 0:
+            return 0
+
+        trajectories = tuple(self._active_trajectories.values())
+        candidates = tuple(
+            TrajectoryCancellationCandidate(
+                task_id=trajectory.task_id,
+                group_id=trajectory.group_id,
+                repetition_id=trajectory.repetition_id,
+                started_at_s=trajectory.started_at_s,
+                training_phase=trajectory.training_phase,
+            )
+            for trajectory in trajectories
+            if trajectory.shed_reason is None and not trajectory.task.done()
+        )
+        selected_ids = self.trajectory_cancellation_policy.select_trajectories(candidates, shed_count)
+
+        cancelled = 0
+        for task_id in dict.fromkeys(selected_ids):
+            if cancelled >= shed_count:
+                break
+            trajectory = self._active_trajectories.get(task_id)
+            if trajectory is None or trajectory.shed_reason is not None or trajectory.task.done():
+                continue
+            trajectory.shed_reason = reason
+            trajectory.task.cancel()
+            cancelled += 1
+
+        if cancelled:
+            logger.warning(
+                "Adaptive sampling requested shedding {} trajectories; cancelling {} trajectory attempts (reason={})",
+                shed_count,
+                cancelled,
+                reason,
+            )
+        return cancelled
+
+    async def _run_trajectory(
+        self,
+        *,
+        index: int,
+        input_batch: GeneratorInput,
+        max_tokens: int,
+        max_input_length: int,
+        sampling_params: Optional[Dict[str, Any]],
+        cache_salt: Optional[str],
+        training_phase: TrainingPhase | None,
+    ) -> Tuple[int, Union[TrajectoryOutput, StepWiseOutput]]:
+        """Run one trajectory, retrying only this member when it is shed."""
+
+        prompts = input_batch["prompts"]
+        env_classes = input_batch["env_classes"]
+        env_extras = input_batch["env_extras"]
+        trajectory_ids = input_batch.get("trajectory_ids")
+        assert env_extras is not None, "`env_extras` is required by SkyRLGymGenerator"
+        trajectory_id = trajectory_ids[index] if trajectory_ids is not None else None
+        group_id = trajectory_id.instance_id if trajectory_id is not None else None
+        repetition_id = trajectory_id.repetition_id if trajectory_id is not None else None
+
+        attempt = 0
+        while True:
+            task_id = uuid4().hex
+            task = asyncio.create_task(
+                self.agent_loop(
+                    prompts[index],
+                    env_classes[index],
+                    env_extras[index],
+                    max_tokens,
+                    max_input_length,
+                    sampling_params=sampling_params,
+                    trajectory_id=trajectory_id,
+                    cache_salt=cache_salt,
+                ),
+                name=f"skyrl-trajectory-{group_id or 'ungrouped'}-{repetition_id if repetition_id is not None else index}",
+            )
+            trajectory = _ActiveTrajectory(
+                task_id=task_id,
+                group_id=group_id,
+                repetition_id=repetition_id,
+                training_phase=training_phase,
+                started_at_s=time.monotonic(),
+                task=task,
+            )
+            self._active_trajectories[task_id] = trajectory
+
+            try:
+                return index, await task
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                owner_was_cancelled = bool(current_task is not None and current_task.cancelling())
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                if trajectory.shed_reason is not None and not owner_was_cancelled:
+                    attempt += 1
+                    logger.info(
+                        "Retrying trajectory group={} repetition={} after adaptive shedding (attempt={}, reason={})",
+                        group_id,
+                        repetition_id,
+                        attempt,
+                        trajectory.shed_reason,
+                    )
+                    continue
+                raise
+            except BaseException:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            finally:
+                self._active_trajectories.pop(task_id, None)
+
     async def generate(self, input_batch: GeneratorInput, disable_tqdm: bool = False) -> GeneratorOutput:
         """
         Generate trajectories for the input batch.
@@ -838,29 +1060,42 @@ class SkyRLGymGenerator(GeneratorInterface):
                 prompts, env_classes, env_extras, max_tokens, sampling_params, cache_salt=cache_salt
             )
 
-        # Async agent loop to generate trajectories in parallel.
-        tasks = []
-        for i in range(len(prompts)):
-            tasks.append(
-                self.agent_loop(
-                    prompts[i],
-                    env_classes[i],
-                    env_extras[i],
-                    max_tokens,
-                    max_input_length,
-                    sampling_params=sampling_params,
-                    trajectory_id=trajectory_ids[i] if trajectory_ids is not None else None,
-                    cache_salt=cache_salt,
-                )
-            )
-
-        all_outputs = await tqdm.gather(
-            *tasks,
+        batch_metadata = input_batch.get("batch_metadata")
+        training_phase = batch_metadata.training_phase if batch_metadata is not None else None
+        progress = tqdm(
+            total=len(prompts),
             desc="Generating Trajectories",
-            miniters=max(1, len(tasks) // 10),
+            miniters=max(1, len(prompts) // 10),
             mininterval=5,
             disable=disable_tqdm,
         )
+
+        async def run_trajectory(index: int):
+            output = await self._run_trajectory(
+                index=index,
+                input_batch=input_batch,
+                max_tokens=max_tokens,
+                max_input_length=max_input_length,
+                sampling_params=sampling_params,
+                cache_salt=cache_salt,
+                training_phase=training_phase,
+            )
+            progress.update(1)
+            return output
+
+        trajectory_tasks = [asyncio.create_task(run_trajectory(index)) for index in range(len(prompts))]
+        try:
+            indexed_outputs = await asyncio.gather(*trajectory_tasks)
+        except BaseException:
+            for task in trajectory_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*trajectory_tasks, return_exceptions=True)
+            raise
+        finally:
+            progress.close()
+
+        all_outputs = [output for _, output in sorted(indexed_outputs, key=lambda item: item[0])]
         # Per-trajectory end-to-end generation times (one entry per prompt, preserving input order).
         # ``e2e_time`` is optional for agent loops; if any trajectory did not record it, we omit the
         # field entirely rather than emit a partially-populated list.

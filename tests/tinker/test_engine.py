@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from cloudpathlib import AnyPath
-from sqlmodel import Session, SQLModel
+from sqlmodel import Session, SQLModel, select
 
 from skyrl.tinker import types
 from skyrl.tinker.config import EngineConfig
@@ -200,6 +200,8 @@ def scheduling_engine():
     engine.db_engine = create_engine("sqlite:///:memory:", echo=False)
     enable_sqlite_wal(engine.db_engine)
     SQLModel.metadata.create_all(engine.db_engine)
+    engine.sampling_concurrency_controller = None
+    engine._forwarding_client = None
     return engine
 
 
@@ -394,11 +396,11 @@ def test_find_batchable_model_passes_stops_at_barrier(scheduling_engine):
     assert request_data.data[0].loss_fn_inputs.target_tokens.data == [1, 2, 3]
 
 
-def sample_payload(checkpoint_id: str) -> dict:
+def sample_payload(checkpoint_id: str, num_samples: int = 1) -> dict:
     return types.SampleInput(
         prompt=types.ModelInput(chunks=[types.EncodedTextChunk(tokens=[1, 2])]),
         sampling_params=types.SamplingParams(temperature=1.0, max_tokens=4, seed=0),
-        num_samples=1,
+        num_samples=num_samples,
         checkpoint_id=checkpoint_id,
         prompt_logprobs=False,
     ).model_dump(mode="json")
@@ -423,6 +425,66 @@ def test_find_batchable_sample_keeps_one_checkpoint_per_model(scheduling_engine)
 
     assert set(batchable) == {str(request_ids[0]), str(request_ids[2]), str(request_ids[3])}
     assert batchable[str(request_ids[0])][1].checkpoint_id == "ckpt_1"
+
+
+def test_sample_admission_is_weighted_by_num_samples(scheduling_engine):
+    engine = scheduling_engine
+    engine.config = EngineConfig.model_validate(
+        {
+            "base_model": BASE_MODEL,
+            "backend": "fsdp",
+            "sampling_concurrency": {"enabled": True, "initial_limit": 5},
+        }
+    )
+    request_ids = add_futures(
+        engine,
+        [
+            (types.RequestType.SAMPLE, "model_a", sample_payload("ckpt", num_samples=3)),
+            (types.RequestType.SAMPLE, "model_b", sample_payload("ckpt", num_samples=4)),
+            (types.RequestType.SAMPLE, "model_c", sample_payload("ckpt", num_samples=2)),
+        ],
+    )
+
+    with Session(engine.db_engine) as session:
+        batchable = engine.find_batchable_sample(session)
+        engine.dispatch_sample_requests(session, batchable)
+
+    assert set(batchable) == {str(request_ids[0]), str(request_ids[2])}
+    with Session(engine.db_engine) as session:
+        statuses = {row.request_id: row.status for row in session.exec(select(FutureDB)).all()}
+    assert statuses[request_ids[0]] == RequestStatus.DISPATCHED
+    assert statuses[request_ids[1]] == RequestStatus.PENDING
+    assert statuses[request_ids[2]] == RequestStatus.DISPATCHED
+
+
+def test_external_dispatch_uses_same_weighted_admission_contract(scheduling_engine):
+    from skyrl.utils.adaptive_concurrency import (
+        FixedConcurrencyPolicy,
+        SamplingConcurrencyController,
+    )
+
+    engine = scheduling_engine
+    engine._forwarding_client = object()
+    engine.sampling_concurrency_controller = SamplingConcurrencyController(
+        policy=FixedConcurrencyPolicy(), initial_limit=4
+    )
+    request_ids = add_futures(
+        engine,
+        [
+            (types.RequestType.EXTERNAL, "model_a", sample_payload("ckpt", num_samples=3)),
+            (types.RequestType.EXTERNAL, "model_b", sample_payload("ckpt", num_samples=2)),
+        ],
+    )
+
+    with Session(engine.db_engine) as session:
+        selected = engine.find_dispatchable_external_samples(session)
+        dispatched = engine.dispatch_external_samples(session, selected)
+
+    assert set(dispatched) == {str(request_ids[0])}
+    with Session(engine.db_engine) as session:
+        statuses = {row.request_id: row.status for row in session.exec(select(FutureDB)).all()}
+    assert statuses[request_ids[0]] == RequestStatus.DISPATCHED
+    assert statuses[request_ids[1]] == RequestStatus.PENDING
 
 
 def test_payload_lookup_is_chunked(scheduling_engine):

@@ -62,6 +62,7 @@ class RequestStatus(str, Enum):
     """Status of a request."""
 
     PENDING = "pending"
+    DISPATCHED = "dispatched"
     COMPLETED = "completed"
     FAILED = "failed"
 
