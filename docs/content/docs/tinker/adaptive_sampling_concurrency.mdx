@@ -3,115 +3,226 @@ title: "Adaptive Sampling Concurrency"
 ---
 
 <Callout type="warn">
-The controller described here is not enabled by a SkyRL training loop or Tinker endpoint yet. This page documents the
-backend-neutral primitive and the intended integration boundary so the service ownership and feedback transport can be
-reviewed before rollout behavior changes.
+These contracts and the queue-delay policy are review scaffolding. No SkyRL training loop or Tinker endpoint composes a
+policy yet, and the richer engine-load policy and trajectory-shedding path described below remain proposed.
 </Callout>
 
-RL clients know how many logical trajectories they want, but generally do not know the capacity of the inference backend.
-A fixed client-side trajectory count therefore mixes two separate concerns:
+RL clients know how many logical trajectories they want, but generally do not know the physical capacity of the
+inference backend. A fixed client-side trajectory count therefore mixes two concerns:
 
 - **Logical concurrency**: how many trajectories the algorithm may have in progress, including trajectories waiting on
   tools, environments, or inference.
-- **Physical sampling concurrency**: how many sampling requests the inference service should admit at once.
+- **Physical sampling concurrency**: how many admission units the inference service should run at once.
 
-Adaptive admission belongs at the sampling client or service boundary. The training loop can keep submitting logical work;
-the admission controller gates only calls into the sampling backend.
+Adaptive admission belongs in the component that already owns pending work. In fully async native training that is
+`_AsyncStalenessManager`; for Tinker it is `TinkerEngine`. The owner composes one stateful `ConcurrencyPolicy` for each
+independently saturated capacity domain. No standalone controller or admission-adapter layer is required.
 
 ```text
-training loop              sampling service / adapter             inference backend
-logical trajectories  ──▶  resizable admission window  ──▶       Fireworks, vLLM, ...
-                            ▲                       │
-                            └── normalized feedback ┘
+backend pressure ── SamplingFeedback ──┐
+                                      │
+completed unit ── SamplingCompletion ─┼─▶ ConcurrencyPolicy ─▶ ConcurrencyDecision
+                                      │                           │
+owner state ── ConcurrencyContext ────┘                           ▼
+                                                     existing admission owner
 ```
 
-This boundary lets the same training loop work with a local SkyRL deployment or a hosted Tinker-compatible service. It
-does not require the loop to discover vLLM replicas, scrape their metrics, or access a generator object directly.
+The policy requests effects but never owns queues, durable rows, permits, or tasks. The admission owner applies
+`desired_limit` and, when supported, asks its trajectory registry to apply `shed_count`.
 
-## Feedback Contract
+## Policy inputs
 
-`SamplingFeedback` normalizes the signals available after a sampling request:
+### `SamplingFeedback`
 
-| Signal | Admission use | Notes |
+`SamplingFeedback.metrics` is an extensible `Mapping[str, JsonValue]`. Common keys have stable semantics and units,
+missing keys are expected, and specialized backends can add namespaced metrics.
+
+| Common key | Meaning | Typical policy use |
 | --- | --- | --- |
-| `queue_duration_s` | AIMD congestion signal | Optional; the backend or service adapter supplies it |
-| `rate_limited` | Multiplicative decrease | Represents an explicit capacity rejection |
-| `prompt_tokens` | Workload summary | Can later support token-aware priority and accounting |
-| `completion_tokens` | Workload summary | Measures realized decode work, not backend capacity |
-| `cache_hit_tokens` | Workload summary | Allows prompt-cache hit rate to be reported |
-| `request_latency_s` | Observability | Includes model work and network time, so it is not treated as queue pressure |
+| `queue_duration_s` | Time spent queued before generation | Queue-delay AIMD |
+| `rate_limited` | Explicit backend capacity rejection | Multiplicative decrease |
+| `prompt_tokens` | Prompt work for the completed request | Accounting and future workload-aware policies |
+| `completion_tokens` | Realized decode work | Accounting and completion context |
+| `cache_hit_tokens` | Prompt tokens served from cache | Cache-efficiency observation |
+| `request_latency_s` | End-to-end request latency | Observability; not by itself a capacity signal |
+| `engine.loads` | Coherent list of per-engine load objects from one poll | Engine-load-aware admission |
 
-Token counts describe the size of work. They do not provide an absolute concurrency target: a 1-GPU backend and a 16-GPU
-backend can receive the same average token load while having very different spare capacity. The initial controller
-therefore adjusts only when it receives queue pressure or an explicit rate limit.
-
-## Control Law
-
-`AdaptiveSamplingConcurrencyController` uses additive increase/multiplicative decrease (AIMD) over completed-request
-intervals:
-
-- If average queue duration is at or below the target, increase the admission limit by a small fixed step.
-- If average queue duration is above the target, multiply the limit by a decrease ratio.
-- If any request in the interval was rate-limited, take the decrease path.
-- If an interval has no queue or rate-limit feedback, keep the limit unchanged.
-
-The limit stays between configured minimum and maximum values. Decreasing it does not cancel admitted requests; new
-requests wait until in-flight work drains below the new limit.
+Each `engine.loads` entry has this standard shape:
 
 ```python
+{
+    "engine_id": "decode-0",
+    "role": "decode",
+    "kv_capacity_tokens": 131_072,
+    "max_model_len": 32_768,
+    "kv_usage": 0.72,
+    "running": 12,
+    "waiting": 2,
+    "waiting_capacity": 1,
+    "preemptions_delta": 0,
+}
+```
+
+The entire list represents one polling round. This lets an engine-load policy distinguish prefill and decode roles,
+aggregate KV capacity, classify queue pressure, and react to preemptions without coupling the policy to a metrics client.
+Backends that cannot provide the complete shape omit `engine.loads` and select a less informed policy.
+
+### `SamplingCompletion`
+
+`SamplingCompletion` reports one completed admission unit with its token count, duration, and optional extensible
+metadata. In fully async RL the unit is normally a trajectory group, not every model call within a multi-turn trajectory.
+
+The explicit completion hook allows a richer policy to pace growth by pipeline turnover. A metrics poll can declare that
+growth is safe, while subsequent completions advance the growth clock. Error completions with zero tokens can be ignored
+without mistaking a fast-failing workload for available inference capacity.
+
+### `ConcurrencyContext`
+
+The admission owner captures this context every time it calls a policy hook:
+
+```python
+ConcurrencyContext(
+    current_limit=32,
+    in_flight=30,
+    observed_at_s=time.monotonic(),
+)
+```
+
+`current_limit` and `in_flight` let the policy determine whether admission is binding, compute a new target from current
+load, and calculate how much active work must be shed. `observed_at_s` lets a policy expire stale growth permission without
+owning a timer or clock.
+
+## Policy output
+
+Both policy hooks return either no action or a `ConcurrencyDecision`:
+
+```python
+ConcurrencyDecision(
+    desired_limit=24,
+    shed_count=6,
+    reason="kv headroom hard trim",
+)
+```
+
+- `desired_limit` controls future admission.
+- `shed_count=0` performs a soft trim: the owner blocks new admission and lets current work drain naturally.
+- A positive `shed_count` requests active cancellation when that execution path supports it.
+- `reason` is suitable for logs and metrics.
+
+The decision deliberately identifies how much work to shed, not which work. In fully async training a separate
+`TrajectoryCancellationPolicy` can select the youngest, stalest, least-progressed, or otherwise cheapest trajectories.
+Hosted transports that cannot cancel in-flight requests apply only the new admission limit.
+
+## Policies
+
+`ConcurrencyPolicy` has two synchronous hooks so a single owner can serialize state transitions without awaiting inside
+the policy:
+
+```python
+class ConcurrencyPolicy(Protocol):
+    def on_feedback(
+        self,
+        feedback: SamplingFeedback,
+        context: ConcurrencyContext,
+    ) -> ConcurrencyDecision | None: ...
+
+    def on_completion(
+        self,
+        completion: SamplingCompletion,
+        context: ConcurrencyContext,
+    ) -> ConcurrencyDecision | None: ...
+```
+
+The intended policy tiers are:
+
+| Policy | Required visibility | Status |
+| --- | --- | --- |
+| `EngineLoadConcurrencyPolicy` | Per-engine KV, capacity, queue, role, and preemption data | Proposed |
+| `QueueDelayConcurrencyPolicy` | Queue duration or explicit rate limiting | Implemented as a primitive |
+| `FixedConcurrencyPolicy` | No trustworthy pressure signal | Implemented fallback |
+
+`QueueDelayConcurrencyPolicy` uses additive increase/multiplicative decrease over feedback intervals. It deliberately
+does not infer capacity from token counts or end-to-end latency. A 1-GPU backend and a 16-GPU backend can receive the same
+average token load while having very different spare capacity.
+
+```python
+import time
+
 from skyrl.utils.adaptive_concurrency import (
-    AdaptiveSamplingConcurrencyController,
+    ConcurrencyContext,
+    QueueDelayConcurrencyPolicy,
+    ResizableConcurrencyLimiter,
     SamplingFeedback,
 )
 
-controller = AdaptiveSamplingConcurrencyController(
-    initial_limit=16,
+limiter = ResizableConcurrencyLimiter(16)
+policy = QueueDelayConcurrencyPolicy(
     max_limit=256,
     queue_duration_target_s=0.2,
 )
 
-async with controller.limiter.slot():
-    response = await sampler.sample(prompt, sampling_params)
-
-adjustment = await controller.observe(
+# The existing admission owner captures its state and applies the decision.
+decision = policy.on_feedback(
     SamplingFeedback(
-        queue_duration_s=response.prefill_queue_duration,
-        prompt_tokens=len(prompt_tokens),
-        completion_tokens=len(response.tokens),
-    )
+        {
+            "queue_duration_s": response.prefill_queue_duration,
+            "prompt_tokens": len(prompt_tokens),
+            "completion_tokens": len(response.tokens),
+        }
+    ),
+    ConcurrencyContext(
+        current_limit=limiter.limit,
+        in_flight=limiter.in_flight,
+        observed_at_s=time.monotonic(),
+    ),
 )
+if decision is not None:
+    await limiter.resize(decision.desired_limit)
 ```
 
-The adapter should publish the returned `ConcurrencyAdjustment` fields as metrics when an interval completes.
+## Backend mappings
 
-## Backend Mappings
+### Native SkyRL / managed vLLM
+
+`VLLMMetricsScraper` already exposes several aggregate load signals. Extending its output with a coherent `engine.loads`
+snapshot would make a rich engine-load policy possible. `_AsyncStalenessManager` would compose that policy, enforce the
+result together with the algorithmic staleness bound, and provide current admission context.
+
+Selective shedding additionally requires cancellable per-group child tasks and an in-flight trajectory registry. The
+long-lived generator worker loop itself must not be cancelled because that would permanently shrink the worker pool.
 
 ### Fireworks
 
-Fireworks' Tinker-compatible `DeploymentSampler` reports `prefill_queue_duration`, which maps directly to
-`queue_duration_s`. This follows the same queue-delay control approach as Fireworks'
-[`AdaptiveConcurrencyController`](https://docs.fireworks.ai/fine-tuning/training-api/reference/deployment-sampler).
+Fireworks' Tinker-compatible `DeploymentSampler` reports `prefill_queue_duration`, which maps to `queue_duration_s` and
+can drive `QueueDelayConcurrencyPolicy`.
 
-### Standard Tinker response
+### Tinker
 
-A standard Tinker `SampleResponse` exposes generated sequences and prompt-cache-hit tokens. An adapter can populate token
-and cache summaries from those fields, but the public response does not currently carry backend queue duration. Without
-optional service metadata or rate-limit feedback, the admission limit remains fixed rather than inferring capacity from
-latency.
+`asample()` should persist the request and return its `APIFuture` without waiting for an admission slot. `TinkerEngine`
+would admit durable `PENDING` work in the background and atomically move admitted rows to `DISPATCHED` before launching
+engine execution or concurrent forwarding.
 
-### Native SkyRL / vLLM
+A standard Tinker response can provide token and cache summaries but may not expose queue or engine pressure. In that
+case `FixedConcurrencyPolicy` is the safe default. Lowering admission can always delay future dispatch; cancelling a
+hosted in-flight request requires explicit transport support.
 
-SkyRL can eventually populate the same contract from response metadata added at the router or inference-service boundary.
-The existing vLLM metrics scraper is useful for aggregate monitoring, but coupling this controller to trainer-side metric
-scraping would make hosted and local sampling behave differently.
+## Engine-load policy compatibility
 
-## Follow-up Integration Decisions
+The contract is intentionally sufficient for a Prime-RL-style controller:
 
-This primitive leaves three decisions for the integration PR:
+- `engine.loads` carries the coherent capacity and pressure snapshot.
+- `on_completion` supports turnover-paced multiplicative growth.
+- `ConcurrencyContext` replaces callbacks that read the dispatcher's current limit and in-flight count.
+- `desired_limit` expresses growth, soft trimming, and hard cuts.
+- `shed_count` expresses the in-flight excess to cancel after a hard cut.
 
-1. Whether the controller is owned by the Tinker sampling service or by each sampling-client adapter.
-2. How optional queue feedback is transported for backends that do not already return it.
-3. How token estimates, cache locality, and trajectory state become priority hints once basic admission is stable.
+Thresholds, cooldowns, persistence counters, drain mode, escalation state, and initial-limit bootstrap all remain private
+state inside `EngineLoadConcurrencyPolicy`. Porting that algorithm does not require another controller abstraction.
 
-The third item is the path toward program-aware scheduling. It is intentionally separate from discovering a safe physical
-concurrency window.
+## Follow-up integration work
+
+1. Implement and test `EngineLoadConcurrencyPolicy` against recorded vLLM metric traces.
+2. Extend `VLLMMetricsScraper` to construct coherent `engine.loads` snapshots.
+3. Compose policies in `_AsyncStalenessManager` and `TinkerEngine` with one instance per capacity domain.
+4. Add per-group child tasks, an in-flight registry, and cancellation accounting for fully async trajectory shedding.
+5. Add Tinker's `DISPATCHED` state and concurrent background forwarding before applying adaptive admission there.
