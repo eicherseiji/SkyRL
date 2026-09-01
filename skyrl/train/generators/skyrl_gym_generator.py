@@ -37,6 +37,11 @@ from skyrl.train.generators.utils import (
     get_generation_prompt_ids,
     get_rollout_metrics,
 )
+from skyrl.utils.adaptive_concurrency import (
+    FixedConcurrencyPolicy,
+    QueueDelayConcurrencyPolicy,
+    SamplingConcurrencyController,
+)
 from skyrl_gym.envs.base_text_env import BaseTextEnvStepOutput
 
 
@@ -145,6 +150,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         inference_engine_client: InferenceEngineInterface,
         tokenizer,
         policy_model_name: Optional[str] = None,
+        sampling_concurrency_controller: Optional[SamplingConcurrencyController] = None,
     ):
         """
         Args:
@@ -156,12 +162,48 @@ class SkyRLGymGenerator(GeneratorInterface):
                 into every ``client.generate(...)`` call as ``model``. When
                 ``None`` (default), the client falls back to its own
                 ``model_name``
+            sampling_concurrency_controller: Optional custom controller. When
+                omitted and ``generator.sampling_concurrency.enabled`` is true,
+                the generator constructs the configured built-in controller.
         """
         self.generator_cfg = generator_cfg
         self.skyrl_gym_cfg = skyrl_gym_cfg
         self.inference_engine_client = inference_engine_client
         self.tokenizer = tokenizer
         self.policy_model_name = policy_model_name
+        self.sampling_concurrency_controller = sampling_concurrency_controller
+        if self.sampling_concurrency_controller is None and generator_cfg.sampling_concurrency.enabled:
+            concurrency_cfg = generator_cfg.sampling_concurrency
+            if concurrency_cfg.policy == "fixed":
+                policy = FixedConcurrencyPolicy()
+            elif concurrency_cfg.policy == "queue_delay":
+                policy = QueueDelayConcurrencyPolicy(
+                    min_limit=concurrency_cfg.min_limit,
+                    max_limit=concurrency_cfg.max_limit,
+                    queue_duration_target_s=concurrency_cfg.queue_duration_target_s,
+                    adjustment_interval=concurrency_cfg.adjustment_interval,
+                    additive_step=concurrency_cfg.additive_step,
+                    decrease_ratio=concurrency_cfg.decrease_ratio,
+                )
+            else:  # Defensive for programmatic configs that bypass Literal validation.
+                raise ValueError(f"Unknown sampling concurrency policy: {concurrency_cfg.policy}")
+            self.sampling_concurrency_controller = SamplingConcurrencyController(
+                policy=policy,
+                initial_limit=concurrency_cfg.initial_limit,
+            )
+
+        if self.sampling_concurrency_controller is not None:
+            attached = inference_engine_client.set_sampling_concurrency_controller(self.sampling_concurrency_controller)
+            if not attached:
+                raise ValueError(
+                    f"{type(inference_engine_client).__name__} does not support per-request sampling admission; "
+                    "override set_sampling_concurrency_controller() to opt in"
+                )
+            logger.info(
+                "Sampling concurrency enabled with policy={} and initial_limit={}",
+                type(self.sampling_concurrency_controller.policy).__name__,
+                self.sampling_concurrency_controller.current_limit,
+            )
         self.max_turns = generator_cfg.max_turns
         self.batched = generator_cfg.batched
         self.use_conversation_multi_turn = generator_cfg.use_conversation_multi_turn

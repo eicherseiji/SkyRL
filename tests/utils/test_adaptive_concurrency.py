@@ -8,10 +8,13 @@ from skyrl.utils.adaptive_concurrency import (
     ConcurrencyPolicy,
     FixedConcurrencyPolicy,
     QueueDelayConcurrencyPolicy,
+    RequestSamplingFeedback,
     ResizableConcurrencyLimiter,
     SamplingCompletion,
     SamplingConcurrencyController,
     SamplingFeedback,
+    VLLMEngineLoad,
+    VLLMEngineSamplingFeedback,
 )
 
 
@@ -75,6 +78,21 @@ async def test_slot_releases_after_exception():
     assert limiter.in_flight == 0
     async with limiter.slot():
         assert limiter.in_flight == 1
+
+
+@pytest.mark.asyncio
+async def test_weighted_slot_accounts_in_sampled_sequence_units():
+    limiter = ResizableConcurrencyLimiter(4)
+
+    async with limiter.slot(units=3):
+        assert limiter.in_flight == 3
+        waiter = asyncio.create_task(limiter.acquire(units=2))
+        await asyncio.sleep(0)
+        assert not waiter.done()
+
+    await asyncio.wait_for(waiter, timeout=1)
+    assert limiter.in_flight == 2
+    await limiter.release(units=2)
 
 
 @pytest.mark.asyncio
@@ -178,6 +196,41 @@ def test_queue_delay_policy_increases_limit_after_feedback_interval():
     assert decision == ConcurrencyDecision(desired_limit=5, reason="below_queue_target")
 
 
+def test_fireworks_headers_become_typed_request_feedback():
+    feedback = RequestSamplingFeedback.from_fireworks_headers(
+        {
+            "fireworks-prefill-queue-duration": "0.25",
+            "cached-prompt-tokens": "80",
+            "prompt-tokens": "100",
+            "generation-queue-duration": "0.05",
+            "num-concurrent-requests": "12",
+        },
+        request_latency_s=0.8,
+        completion_tokens=20,
+        http_status_code=200,
+    )
+
+    assert feedback.source == "fireworks"
+    assert feedback.queue_duration_s == 0.25
+    assert feedback.cache_hit_tokens == 80
+    assert feedback.prompt_tokens == 100
+    assert feedback.completion_tokens == 20
+    assert feedback.metrics["fireworks.generation_queue_duration_s"] == 0.05
+    assert feedback.metrics["fireworks.num_concurrent_requests"] == 12
+
+
+def test_fireworks_serverless_overload_becomes_rate_limit_feedback():
+    feedback = RequestSamplingFeedback.from_fireworks_headers({}, http_status_code=503)
+
+    assert feedback.queue_duration_s is None
+    assert feedback.rate_limited is True
+    assert feedback.boolean("rate_limited") is True
+
+    transport_feedback = RequestSamplingFeedback.from_fireworks_headers({}, transport_error=True)
+    assert transport_feedback.rate_limited is True
+    assert transport_feedback.metrics["fireworks.transport_error"] is True
+
+
 def test_queue_delay_policy_decreases_limit_on_high_queue_duration():
     policy = QueueDelayConcurrencyPolicy(
         min_limit=2,
@@ -258,34 +311,35 @@ def test_queue_delay_policy_leaves_completion_growth_to_richer_policies():
 
 
 def test_feedback_accepts_a_coherent_engine_load_snapshot():
-    loads = [
-        {
-            "engine_id": "decode-0",
-            "role": "decode",
-            "kv_capacity_tokens": 131_072,
-            "max_model_len": 32_768,
-            "kv_usage": 0.72,
-            "running": 12,
-            "waiting": 2,
-            "waiting_capacity": 1,
-            "preemptions_delta": 0,
-        },
-        {
-            "engine_id": "prefill-0",
-            "role": "prefill",
-            "kv_capacity_tokens": None,
-            "max_model_len": 32_768,
-            "kv_usage": 0.1,
-            "running": 4,
-            "waiting": 0,
-            "waiting_capacity": None,
-            "preemptions_delta": 0,
-        },
-    ]
+    loads = (
+        VLLMEngineLoad(
+            engine_id="decode-0",
+            role="decode",
+            kv_capacity_tokens=131_072,
+            max_model_len=32_768,
+            kv_usage=0.72,
+            running=12,
+            waiting=2,
+            waiting_capacity=1,
+            preemptions_delta=0,
+        ),
+        VLLMEngineLoad(
+            engine_id="prefill-0",
+            role="prefill",
+            kv_capacity_tokens=None,
+            max_model_len=32_768,
+            kv_usage=0.1,
+            running=4,
+            waiting=0,
+            waiting_capacity=None,
+            preemptions_delta=0,
+        ),
+    )
 
-    feedback = SamplingFeedback({"engine.loads": loads, "backend.router.requests": 16})
+    feedback = VLLMEngineSamplingFeedback(metrics={"backend.router.requests": 16}, engine_loads=loads)
 
-    assert feedback.metrics["engine.loads"] == loads
+    assert feedback.engine_loads == loads
+    assert feedback.metrics["engine.loads"][0]["engine_id"] == "decode-0"
 
 
 @pytest.mark.parametrize(

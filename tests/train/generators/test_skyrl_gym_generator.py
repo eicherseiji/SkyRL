@@ -142,6 +142,41 @@ def mock_env_cfg():
     return cfg
 
 
+def test_generator_owns_and_attaches_configured_sampling_controller(
+    mock_tokenizer, mock_llm, generator_cfg, mock_env_cfg
+):
+    generator_cfg.sampling_concurrency.enabled = True
+    generator_cfg.sampling_concurrency.initial_limit = 3
+    mock_llm.set_sampling_concurrency_controller.return_value = True
+
+    generator = SkyRLGymGenerator(
+        generator_cfg=generator_cfg,
+        skyrl_gym_cfg=mock_env_cfg,
+        inference_engine_client=mock_llm,
+        tokenizer=mock_tokenizer,
+    )
+
+    controller = generator.sampling_concurrency_controller
+    assert controller is not None
+    assert controller.current_limit == 3
+    mock_llm.set_sampling_concurrency_controller.assert_called_once_with(controller)
+
+
+def test_generator_rejects_enabled_admission_for_client_without_request_gate(
+    mock_tokenizer, mock_llm, generator_cfg, mock_env_cfg
+):
+    generator_cfg.sampling_concurrency.enabled = True
+    mock_llm.set_sampling_concurrency_controller.return_value = False
+
+    with pytest.raises(ValueError, match="does not support per-request sampling admission"):
+        SkyRLGymGenerator(
+            generator_cfg=generator_cfg,
+            skyrl_gym_cfg=mock_env_cfg,
+            inference_engine_client=mock_llm,
+            tokenizer=mock_tokenizer,
+        )
+
+
 def validate_generator_input(input_batch: GeneratorInput) -> bool:
     """Validate that input_batch conforms to GeneratorInput TypedDict interface."""
     # Check that input_batch has the required keys

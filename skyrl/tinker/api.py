@@ -40,10 +40,6 @@ from skyrl.tinker.db_models import (
     enable_sqlite_wal,
     get_async_database_url,
 )
-from skyrl.tinker.extra import (
-    ExternalInferenceClient,
-    SkyRLTrainInferenceForwardingClient,
-)
 from skyrl.utils.log import get_uvicorn_log_config, logger
 from skyrl.utils.storage import download_file
 
@@ -208,7 +204,9 @@ async def lifespan(app: FastAPI):
     app.state.future_waiters = {}
     app.state.future_poller = asyncio.create_task(poll_futures(app.state.db_engine, app.state.future_waiters))
 
-    # Setup external inference client if configured.
+    # Decide whether sample rows use TinkerEngine's asynchronous forwarding
+    # lane. The API process only persists work; it never waits for admission
+    # or owns forwarding tasks.
     #
     # Three cases:
     #   1. external_inference_url set: forward sample requests to a fully
@@ -228,18 +226,16 @@ async def lifespan(app: FastAPI):
     # when the operator explicitly sets it to False.
     is_colocated = bool(backend_cfg.get("trainer.placement.colocate_all", True))
     if app.state.engine_config.external_inference_url:
-        app.state.external_inference_client = ExternalInferenceClient(app.state.engine_config, app.state.db_engine)
+        app.state.external_inference_enabled = True
         logger.info(f"External engine configured: {app.state.engine_config.external_inference_url}")
     elif backend_name in ("megatron", "fsdp") and not is_colocated:
-        app.state.external_inference_client = SkyRLTrainInferenceForwardingClient(
-            app.state.engine_config, app.state.db_engine
-        )
+        app.state.external_inference_enabled = True
         logger.info(
-            "SkyRL-Train inference forwarding client enabled for non-colocated backend=%s",
+            "SkyRL-Train inference forwarding enabled for non-colocated backend=%s",
             backend_name,
         )
     else:
-        app.state.external_inference_client = None
+        app.state.external_inference_enabled = False
         logger.info("Using internal engine for inference")
 
     # Build subprocess command with engine config parameters.
@@ -284,15 +280,6 @@ async def lifespan(app: FastAPI):
     app.state.future_poller.cancel()
     with suppress(asyncio.CancelledError):
         await app.state.future_poller
-
-    # Close the forwarding client's persistent httpx connection pool if we
-    # installed one. Cheap no-op when external_inference_client doesn't own
-    # an httpx client (ExternalInferenceClient creates one per call).
-    inference_client = getattr(app.state, "external_inference_client", None)
-    aclose = getattr(inference_client, "aclose", None)
-    if aclose is not None:
-        with suppress(Exception):
-            await aclose()
 
     logger.info(f"Stopping background engine (PID {app.state.background_engine.pid})")
     with suppress(ProcessLookupError):
@@ -1246,7 +1233,7 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
     request_id = await create_future(
         session=session,
         request_type=(
-            types.RequestType.EXTERNAL if req.app.state.external_inference_client else types.RequestType.SAMPLE
+            types.RequestType.EXTERNAL if req.app.state.external_inference_enabled else types.RequestType.SAMPLE
         ),
         model_id=model_id,
         request_data=types.SampleInput(
@@ -1265,13 +1252,6 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
     )
 
     await session.commit()
-
-    if req.app.state.external_inference_client:
-        asyncio.create_task(
-            req.app.state.external_inference_client.call_and_store_result(
-                request_id, request, model_id, checkpoint_id, base_model=base_model
-            )
-        )
 
     return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
 

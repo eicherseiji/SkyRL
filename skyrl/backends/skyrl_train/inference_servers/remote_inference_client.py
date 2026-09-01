@@ -81,6 +81,11 @@ from skyrl.env_vars import (
     SKYRL_GENERATE_CONCURRENCY_PER_ENGINE,
     SKYRL_HTTP_CONNECTION_LIMIT,
 )
+from skyrl.utils.adaptive_concurrency import (
+    RequestSamplingFeedback,
+    SamplingCompletion,
+    SamplingConcurrencyController,
+)
 
 _DATA_PLANE_RETRIES = 30
 
@@ -230,6 +235,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
     _gen_sem: Optional[asyncio.Semaphore] = field(default=None, repr=False)
     _detok_sem: Optional[asyncio.Semaphore] = field(default=None, repr=False)
     _sem_loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
+    _sampling_concurrency_controller: Optional[SamplingConcurrencyController] = field(default=None, repr=False)
     # Monotonic counter of weight syncs (see `increment_weight_version`); source of the prefix-cache salt.
     _weight_version: int = field(default=0, repr=False)
 
@@ -241,6 +247,12 @@ class RemoteInferenceClient(InferenceEngineInterface):
     def increment_weight_version(self) -> None:
         """Advance the weight version. Called once per completed weight sync to the engines."""
         self._weight_version += 1
+
+    def set_sampling_concurrency_controller(self, controller: SamplingConcurrencyController) -> bool:
+        """Use the generator-owned controller for per-prompt generation admission."""
+
+        self._sampling_concurrency_controller = controller
+        return True
 
     def __post_init__(self):
         if self.data_parallel_size <= 0:
@@ -423,24 +435,41 @@ class RemoteInferenceClient(InferenceEngineInterface):
         batch_size = len(prompt_token_ids)
 
         async def _throttled_generate(idx: int) -> Dict[str, Any]:
+            started_at = asyncio.get_running_loop().time()
+            prompt_ids = prompt_token_ids[idx]
+            session_id = session_ids[idx] if session_ids and idx < len(session_ids) else None
+            features = mm_features[idx] if mm_features and idx < len(mm_features) else None
+
+            async def _call() -> Dict[str, Any]:
+                return await self._generate_single(
+                    prompt_token_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                    session_id=session_id,
+                    mm_features=features,
+                    model=model,
+                    cache_salt=cache_salt,
+                )
+
+            controller = self._sampling_concurrency_controller
+            if controller is not None:
+                async with controller.slot():
+                    result = await _call()
+                duration_s = asyncio.get_running_loop().time() - started_at
+                feedback = RequestSamplingFeedback(
+                    source="hosted",
+                    request_latency_s=duration_s,
+                    prompt_tokens=len(prompt_ids),
+                    completion_tokens=len(result["response_ids"]),
+                )
+                await controller.on_feedback(feedback)
+                await controller.on_completion(
+                    SamplingCompletion(tokens=len(result["response_ids"]), duration_s=duration_s)
+                )
+                return result
             if gen_sem is None:
-                return await self._generate_single(
-                    prompt_token_ids=prompt_token_ids[idx],
-                    sampling_params=sampling_params,
-                    session_id=session_ids[idx] if session_ids and idx < len(session_ids) else None,
-                    mm_features=mm_features[idx] if mm_features and idx < len(mm_features) else None,
-                    model=model,
-                    cache_salt=cache_salt,
-                )
+                return await _call()
             async with gen_sem:
-                return await self._generate_single(
-                    prompt_token_ids=prompt_token_ids[idx],
-                    sampling_params=sampling_params,
-                    session_id=session_ids[idx] if session_ids and idx < len(session_ids) else None,
-                    mm_features=mm_features[idx] if mm_features and idx < len(mm_features) else None,
-                    model=model,
-                    cache_salt=cache_salt,
-                )
+                return await _call()
 
         async def _throttled_detokenize(token_ids: List[int]) -> str:
             if detok_sem is None:

@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from skyrl.backends.skyrl_train.weight_sync.transfer_strategy import (
         WeightSyncInitInfo,
     )
+    from skyrl.utils.adaptive_concurrency import SamplingConcurrencyController
 
 MessageType = Dict[str, str]
 ConversationType = List[MessageType]
@@ -53,6 +54,17 @@ class InferenceEngineOutput(TypedDict):
 
 
 class InferenceEngineInterface(ABC):
+
+    def set_sampling_concurrency_controller(self, controller: "SamplingConcurrencyController") -> bool:
+        """Borrow a generator-owned sampling controller when this client supports per-request admission.
+
+        This is an optional capability rather than an abstract method so custom
+        inference clients keep their existing contract. Implementations return
+        ``True`` only when their sampling request path actually uses the
+        controller.
+        """
+
+        return False
 
     @property
     @abstractmethod

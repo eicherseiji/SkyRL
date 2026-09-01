@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Protocol, TypeAlias, TypedDict, runtime_checkable
+from typing import Literal, Protocol, TypeAlias, runtime_checkable
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
@@ -14,11 +14,13 @@ JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 ENGINE_LOADS_METRIC = "engine.loads"
 
 
-class EngineLoadMetrics(TypedDict):
-    """Standard shape for one entry in an ``engine.loads`` snapshot.
+@dataclass(frozen=True)
+class VLLMEngineLoad:
+    """One coherent vLLM engine-load observation.
 
-    Backends that cannot populate this complete shape should omit
-    ``engine.loads`` and report only the metrics they can observe.
+    This is deliberately a value object instead of a loose metrics dictionary:
+    policies that depend on KV pressure, waiting work, or preemptions must not
+    accidentally combine values from different engines or scrape intervals.
     """
 
     engine_id: str
@@ -31,15 +33,29 @@ class EngineLoadMetrics(TypedDict):
     waiting_capacity: int | None
     preemptions_delta: int
 
+    def __post_init__(self) -> None:
+        if not self.engine_id:
+            raise ValueError("engine_id must not be empty")
+        for name in ("kv_capacity_tokens", "max_model_len", "waiting_capacity"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_non_negative_int(value, path=name)
+        for name in ("running", "waiting", "preemptions_delta"):
+            _require_non_negative_int(getattr(self, name), path=name)
+        if isinstance(self.kv_usage, bool) or not isinstance(self.kv_usage, (int, float)):
+            raise TypeError(f"kv_usage must be numeric, got {type(self.kv_usage).__name__}")
+        if not math.isfinite(self.kv_usage) or self.kv_usage < 0:
+            raise ValueError(f"kv_usage must be a finite non-negative value, got {self.kv_usage}")
+
 
 @dataclass(frozen=True)
 class SamplingFeedback:
-    """One coherent snapshot of backend pressure signals.
+    """Generic backend feedback for custom integrations.
 
-    ``metrics`` is deliberately extensible: common names and units are stable,
-    missing keys are expected, and specialized backends may publish namespaced
-    additions. ``engine.loads`` contains a list of :class:`EngineLoadMetrics`
-    dictionaries from the same metrics poll when per-engine visibility exists.
+    Built-in backends should prefer :class:`VLLMEngineSamplingFeedback` or
+    :class:`RequestSamplingFeedback`. ``metrics`` remains deliberately
+    extensible for custom backends; common names and units are validated so the
+    built-in policies can also consume a generic event when appropriate.
     """
 
     metrics: Mapping[str, JsonValue] = field(default_factory=dict)
@@ -69,6 +85,154 @@ class SamplingFeedback:
         if not isinstance(value, bool):
             raise TypeError(f"{name} must be a boolean, got {type(value).__name__}")
         return value
+
+
+@dataclass(frozen=True)
+class RequestSamplingFeedback(SamplingFeedback):
+    """Typed request-level feedback shared by hosted generation backends.
+
+    Tinker can populate request latency, tokens, and cache hits. Fireworks
+    dedicated deployments additionally expose prefill queue duration in
+    response headers; serverless Fireworks deployments instead communicate
+    overload through HTTP 429/503. Missing fields are expected and remain
+    ``None`` rather than being guessed.
+    """
+
+    source: Literal["tinker", "fireworks", "hosted", "unknown"] = "unknown"
+    queue_duration_s: float | None = None
+    request_latency_s: float | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    cache_hit_tokens: int | None = None
+    rate_limited: bool = False
+
+    def __post_init__(self) -> None:
+        metrics = dict(self.metrics)
+        for name in ("prompt_tokens", "completion_tokens", "cache_hit_tokens"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_non_negative_int(value, path=name)
+        typed_values: dict[str, JsonValue] = {
+            "queue_duration_s": self.queue_duration_s,
+            "request_latency_s": self.request_latency_s,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "cache_hit_tokens": self.cache_hit_tokens,
+            "rate_limited": self.rate_limited,
+        }
+        for name, value in typed_values.items():
+            if value is not None and (name != "rate_limited" or value):
+                existing = metrics.get(name)
+                if existing is not None and existing != value:
+                    raise ValueError(f"{name} was provided twice with different values")
+                metrics[name] = value
+        object.__setattr__(self, "metrics", metrics)
+        super().__post_init__()
+
+    @classmethod
+    def from_fireworks_headers(
+        cls,
+        headers: Mapping[str, object],
+        *,
+        request_latency_s: float | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        http_status_code: int | None = None,
+        transport_error: bool = False,
+    ) -> "RequestSamplingFeedback":
+        """Normalize Fireworks response headers without importing its SDK.
+
+        Fireworks accepts both bare and ``fireworks-``-prefixed metric header
+        names. Durations are seconds. Unknown headers are intentionally not
+        copied into the generic metrics bag because HTTP headers often contain
+        credentials or unrelated transport metadata.
+        """
+
+        normalized = {str(key).lower(): value for key, value in headers.items()}
+
+        def value(name: str) -> object | None:
+            return normalized.get(name, normalized.get(f"fireworks-{name}"))
+
+        def optional_float(name: str) -> float | None:
+            raw = value(name)
+            if raw in (None, ""):
+                return None
+            try:
+                return float(str(raw))
+            except (TypeError, ValueError):
+                return None
+
+        def optional_int(name: str) -> int | None:
+            raw = value(name)
+            if raw in (None, ""):
+                return None
+            try:
+                return int(str(raw))
+            except (TypeError, ValueError):
+                return None
+
+        queue_duration_s = optional_float("prefill-queue-duration")
+        prompt_tokens = optional_int("prompt-tokens") or prompt_tokens
+        cache_hit_tokens = optional_int("cached-prompt-tokens")
+        metrics: dict[str, JsonValue] = {}
+        for header, metric in (
+            ("generation-queue-duration", "fireworks.generation_queue_duration_s"),
+            ("server-time-to-first-token", "fireworks.server_ttft_s"),
+            ("server-processing-time", "fireworks.server_processing_time_s"),
+            ("tokenizer-queue-duration", "fireworks.tokenizer_queue_duration_s"),
+            ("tokenizer-duration", "fireworks.tokenizer_duration_s"),
+            ("prefill-duration", "fireworks.prefill_duration_s"),
+            ("generation-duration", "fireworks.generation_duration_s"),
+        ):
+            parsed = optional_float(header)
+            if parsed is not None:
+                metrics[metric] = parsed
+        concurrent = optional_int("num-concurrent-requests")
+        if concurrent is not None:
+            metrics["fireworks.num_concurrent_requests"] = concurrent
+        if transport_error:
+            metrics["fireworks.transport_error"] = True
+
+        return cls(
+            metrics=metrics,
+            source="fireworks",
+            queue_duration_s=queue_duration_s,
+            request_latency_s=request_latency_s,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cache_hit_tokens=cache_hit_tokens,
+            rate_limited=http_status_code in (429, 503) or transport_error,
+        )
+
+
+@dataclass(frozen=True)
+class VLLMEngineSamplingFeedback(SamplingFeedback):
+    """Typed coherent snapshot from a managed vLLM deployment."""
+
+    engine_loads: tuple[VLLMEngineLoad, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.engine_loads:
+            raise ValueError("engine_loads must not be empty")
+        metrics = dict(self.metrics)
+        if ENGINE_LOADS_METRIC in metrics:
+            raise ValueError(f"{ENGINE_LOADS_METRIC} is derived from engine_loads and must not be supplied in metrics")
+        metrics[ENGINE_LOADS_METRIC] = [
+            {
+                "engine_id": load.engine_id,
+                "role": load.role,
+                "kv_capacity_tokens": load.kv_capacity_tokens,
+                "max_model_len": load.max_model_len,
+                "kv_usage": load.kv_usage,
+                "running": load.running,
+                "waiting": load.waiting,
+                "waiting_capacity": load.waiting_capacity,
+                "preemptions_delta": load.preemptions_delta,
+            }
+            for load in self.engine_loads
+        ]
+        object.__setattr__(self, "metrics", metrics)
+        super().__post_init__()
 
 
 @dataclass(frozen=True)
@@ -203,20 +367,26 @@ class ResizableConcurrencyLimiter:
     def waiting(self) -> int:
         return self._waiting
 
-    async def acquire(self) -> None:
+    async def acquire(self, units: int = 1) -> None:
+        if units < 1:
+            raise ValueError(f"units must be at least 1, got {units}")
         async with self._condition:
             self._waiting += 1
             try:
-                await self._condition.wait_for(lambda: self._in_flight < self._limit)
-                self._in_flight += 1
+                await self._condition.wait_for(
+                    lambda: self._in_flight + units <= self._limit or (units > self._limit and self._in_flight == 0)
+                )
+                self._in_flight += units
             finally:
                 self._waiting -= 1
 
-    async def release(self) -> None:
+    async def release(self, units: int = 1) -> None:
+        if units < 1:
+            raise ValueError(f"units must be at least 1, got {units}")
         async with self._condition:
-            if self._in_flight == 0:
-                raise RuntimeError("cannot release a concurrency slot that is not held")
-            self._in_flight -= 1
+            if self._in_flight < units:
+                raise RuntimeError(f"cannot release {units} concurrency units when only {self._in_flight} are held")
+            self._in_flight -= units
             self._condition.notify_all()
 
     async def resize(self, limit: int) -> None:
@@ -227,14 +397,14 @@ class ResizableConcurrencyLimiter:
             self._condition.notify_all()
 
     @asynccontextmanager
-    async def slot(self) -> AsyncIterator[None]:
-        """Hold one sampled-sequence admission unit for one model request."""
+    async def slot(self, units: int = 1) -> AsyncIterator[None]:
+        """Hold sampled-sequence admission units for one model request."""
 
-        await self.acquire()
+        await self.acquire(units)
         try:
             yield
         finally:
-            await self.release()
+            await self.release(units)
 
 
 class SamplingConcurrencyController:
@@ -290,10 +460,10 @@ class SamplingConcurrencyController:
         )
 
     @asynccontextmanager
-    async def slot(self) -> AsyncIterator[None]:
-        """Hold one native model-request unit in the shared sampling window."""
+    async def slot(self, units: int = 1) -> AsyncIterator[None]:
+        """Hold model-request units in the shared sampling window."""
 
-        async with self._limiter.slot():
+        async with self._limiter.slot(units):
             yield
 
     async def on_feedback(self, feedback: SamplingFeedback) -> ConcurrencyDecision | None:
@@ -466,7 +636,17 @@ def _validate_engine_loads(value: JsonValue) -> None:
     if not isinstance(value, list):
         raise TypeError(f"{ENGINE_LOADS_METRIC} must be a list, got {type(value).__name__}")
 
-    required = EngineLoadMetrics.__required_keys__
+    required = {
+        "engine_id",
+        "role",
+        "kv_capacity_tokens",
+        "max_model_len",
+        "kv_usage",
+        "running",
+        "waiting",
+        "waiting_capacity",
+        "preemptions_delta",
+    }
     for index, load in enumerate(value):
         if not isinstance(load, dict):
             raise TypeError(f"{ENGINE_LOADS_METRIC}[{index}] must be an object, got {type(load).__name__}")

@@ -28,6 +28,11 @@ from skyrl.backends.skyrl_train.inference_servers.setup import (
     build_new_inference_client,
 )
 from skyrl.train.config import SkyRLTrainConfig
+from skyrl.utils.adaptive_concurrency import (
+    FixedConcurrencyPolicy,
+    RequestSamplingFeedback,
+    SamplingConcurrencyController,
+)
 
 
 def create_mock_vllm_server(server_id: int) -> FastAPI:
@@ -441,6 +446,20 @@ class TestRemoteInferenceClientInit:
         # Session should be None after unpickling
         assert restored._session is None
 
+    def test_serialization_preserves_borrowed_sampling_controller(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            data_parallel_size=1,
+        )
+        controller = SamplingConcurrencyController(policy=FixedConcurrencyPolicy(), initial_limit=7)
+        client.set_sampling_concurrency_controller(controller)
+
+        restored = pickle.loads(pickle.dumps(client))
+
+        assert restored._sampling_concurrency_controller is not None
+        assert restored._sampling_concurrency_controller.current_limit == 7
+
 
 class TestDataPlane:
     """Test data plane methods."""
@@ -460,6 +479,38 @@ class TestDataPlane:
         assert all(r == "stop" for r in result["stop_reasons"])
         # response_ids are tokenized from the response
         assert len(result["response_ids"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_generate_uses_borrowed_controller_and_reports_request_feedback(self, client):
+        class RecordingPolicy(FixedConcurrencyPolicy):
+            def __init__(self):
+                self.feedback = []
+                self.completions = []
+
+            def on_feedback(self, feedback, context):
+                self.feedback.append(feedback)
+
+            def on_completion(self, completion, context):
+                self.completions.append(completion)
+
+        policy = RecordingPolicy()
+        controller = SamplingConcurrencyController(policy=policy, initial_limit=1)
+        assert client.set_sampling_concurrency_controller(controller) is True
+
+        result = await client.generate(
+            {
+                "prompt_token_ids": [[1, 2, 3], [4, 5]],
+                "sampling_params": {"max_tokens": 100},
+            }
+        )
+
+        assert len(result["response_ids"]) == 2
+        assert controller.in_flight == 0
+        assert len(policy.feedback) == 2
+        assert all(isinstance(feedback, RequestSamplingFeedback) for feedback in policy.feedback)
+        assert [feedback.prompt_tokens for feedback in policy.feedback] == [3, 2]
+        assert [feedback.completion_tokens for feedback in policy.feedback] == [3, 3]
+        assert len(policy.completions) == 2
 
     @pytest.mark.asyncio
     async def test_generate_with_session_id(self, client):
