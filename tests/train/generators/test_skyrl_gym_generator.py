@@ -166,6 +166,7 @@ def test_generator_owns_and_attaches_configured_sampling_controller(
 def test_generator_builds_engine_load_policy(mock_tokenizer, mock_llm, generator_cfg, mock_env_cfg):
     generator_cfg.sampling_concurrency.enabled = True
     generator_cfg.sampling_concurrency.policy = "engine_load"
+    generator_cfg.batched = False
     mock_llm.set_sampling_concurrency_controller.return_value = True
 
     generator = SkyRLGymGenerator(
@@ -176,6 +177,7 @@ def test_generator_builds_engine_load_policy(mock_tokenizer, mock_llm, generator
     )
 
     assert isinstance(generator.sampling_concurrency_controller.policy, EngineLoadConcurrencyPolicy)
+    assert generator.sampling_concurrency_controller.policy.enable_active_shedding is True
 
 
 @pytest.mark.parametrize(

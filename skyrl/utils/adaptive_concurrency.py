@@ -302,8 +302,8 @@ class ConcurrencyDecision:
     """Effects requested by a policy and applied by the admission owner.
 
     ``desired_limit`` uses sampled-sequence admission units. ``shed_count`` is
-    a count of owner-managed cancellation candidates—for native fully async
-    training, individual trajectory tasks—rather than a durable-row count.
+    a target number of owner-managed trajectories to cancel. An owner may
+    cancel more when its correctness boundary is a complete prompt group.
     """
 
     desired_limit: int
@@ -415,8 +415,10 @@ class SamplingConcurrencyController:
     does not own a second adaptive limit. Policy decisions resize this
     controller's limiter atomically with respect to other policy callbacks.
 
-    ``shed_count`` is deliberately returned to the generator: the controller
-    owns sampling permits, while the generator owns cancellable trajectories.
+    ``shed_count`` is forwarded to an optional decision handler as well as
+    returned to the caller: the controller owns sampling permits, while the
+    generator owns cancellable trajectories. The handler is synchronous so a
+    decision cannot race a subsequent policy transition.
     Durable admission owners such as ``TinkerEngine`` reuse the policy
     contracts directly and apply decisions to their database transition rather
     than using this process-local limiter.
@@ -428,11 +430,13 @@ class SamplingConcurrencyController:
         policy: ConcurrencyPolicy,
         initial_limit: int,
         clock: Callable[[], float] = time.monotonic,
+        decision_handler: Callable[[ConcurrencyDecision], None] | None = None,
     ) -> None:
         self._policy = policy
         self._limiter = ResizableConcurrencyLimiter(initial_limit)
         self._clock = clock
         self._policy_lock = asyncio.Lock()
+        self._decision_handler = decision_handler
 
     @property
     def policy(self) -> ConcurrencyPolicy:
@@ -449,6 +453,11 @@ class SamplingConcurrencyController:
     @property
     def waiting(self) -> int:
         return self._limiter.waiting
+
+    def set_decision_handler(self, handler: Callable[[ConcurrencyDecision], None] | None) -> None:
+        """Set the admission owner's synchronous decision-effects handler."""
+
+        self._decision_handler = handler
 
     def context(self) -> ConcurrencyContext:
         """Capture the limiter state supplied to the next policy hook."""
@@ -483,6 +492,8 @@ class SamplingConcurrencyController:
     async def _apply(self, decision: ConcurrencyDecision | None) -> ConcurrencyDecision | None:
         if decision is not None:
             await self._limiter.resize(decision.desired_limit)
+            if self._decision_handler is not None:
+                self._decision_handler(decision)
         return decision
 
 
@@ -503,8 +514,8 @@ class EngineLoadConcurrencyPolicy:
     clear, soft-trims when KV usage loses headroom, and cuts on preemptions or
     a persistent capacity queue.  It is intentionally a state machine only:
     the controller applies the requested limit and a trajectory owner may
-    later consume ``shed_count``.  Native V1 keeps active shedding disabled,
-    so every downward resize drains naturally.
+    consume ``shed_count``. Native non-batched generation enables active
+    shedding; owners without cancellable trajectory tasks drain naturally.
 
     Thresholds are conservative implementation constants rather than user
     hyperparameters.  The public tuning surface is the initial/min/max window;

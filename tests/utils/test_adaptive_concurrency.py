@@ -134,6 +134,28 @@ async def test_controller_returns_shedding_to_trajectory_owner():
 
 
 @pytest.mark.asyncio
+async def test_controller_forwards_applied_decision_to_owner_handler():
+    class SheddingPolicy:
+        def on_feedback(self, feedback, policy_context):
+            return ConcurrencyDecision(desired_limit=2, shed_count=3, reason="hard_overload")
+
+        def on_completion(self, completion, policy_context):
+            return None
+
+    applied = []
+    controller = SamplingConcurrencyController(
+        policy=SheddingPolicy(),
+        initial_limit=8,
+        decision_handler=applied.append,
+    )
+
+    decision = await controller.on_feedback(SamplingFeedback())
+
+    assert applied == [decision]
+    assert controller.current_limit == 2
+
+
+@pytest.mark.asyncio
 async def test_controller_forwards_weighted_completion_to_policy():
     class CompletionPolicy:
         completion = None

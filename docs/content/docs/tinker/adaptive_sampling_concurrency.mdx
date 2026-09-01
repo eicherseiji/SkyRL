@@ -5,8 +5,9 @@ title: "Adaptive Sampling Concurrency"
 <Callout type="warn">
 This is an opt-in first integration. Native request admission, managed-vLLM engine feedback,
 `EngineLoadConcurrencyPolicy`, Tinker's durable `DISPATCHED` transition, asynchronous external forwarding, and
-request-level hosted feedback are wired. Active fully async trajectory shedding remains follow-up work; v1 applies
-downward engine-load decisions by closing admission and draining existing work.
+request-level hosted feedback are wired. Non-batched native generation can also shed and retry complete training prompt
+groups after a hard pressure decision. Batched generation and hosted transports still apply downward decisions by
+closing admission and draining existing work.
 </Callout>
 
 RL clients know how many logical trajectories they want, but generally do not know the physical capacity of the
@@ -23,7 +24,8 @@ policy contract directly with its database-backed dispatcher. No admission-adapt
 
 ```text
 SkyRLGymGenerator
-├── episode lifecycle
+├── episode lifecycle + in-flight prompt-group registry
+├── YoungestTrainingGroupCancellationPolicy
 └── SamplingConcurrencyController
     ├── ConcurrencyPolicy
     └── ResizableConcurrencyLimiter ◀── RemoteInferenceClient.controller.slot()
@@ -36,9 +38,9 @@ TinkerEngine
 ```
 
 The policy requests effects but never owns queues, durable rows, permits, or tasks. Native
-`SamplingConcurrencyController` captures context and applies `desired_limit` to its co-located limiter. It returns the
-decision to its caller; a future native trajectory-action sink can forward `shed_count` to `SkyRLGymGenerator`.
-`TinkerEngine` captures the same context and applies the decision at its durable dispatch boundary.
+`SamplingConcurrencyController` captures context, applies `desired_limit` to its co-located limiter, and forwards the
+applied decision to its generator-owned effect handler. `SkyRLGymGenerator` consumes `shed_count`; `TinkerEngine`
+captures the same context and applies the decision at its durable dispatch boundary.
 
 ## Policy inputs
 
@@ -137,13 +139,15 @@ ConcurrencyDecision(
 
 - `desired_limit` controls future admission.
 - `shed_count=0` performs a soft trim: the owner blocks new admission and lets current work drain naturally.
-- A positive `shed_count` requests that many owner-managed cancellation candidates when that execution path supports
-  it. In native fully async training those candidates are individual trajectory tasks, not prompt groups or DB rows.
+- A positive `shed_count` is a target number of owner-managed trajectories to cancel when that execution path supports
+  it. Native generation cancels complete prompt groups, so the actual number cancelled may exceed the target.
 - `reason` is suitable for logs and metrics.
 
-The decision deliberately identifies how much work to shed, not which work. In fully async training a separate
-`TrajectoryCancellationPolicy` can select the youngest, stalest, least-progressed, or otherwise cheapest trajectories.
-Hosted transports that cannot cancel in-flight requests apply only the new admission limit.
+The decision deliberately identifies how much work to shed, not which work. Native generation delegates selection to a
+`TrajectoryGroupCancellationPolicy`; v1's `YoungestTrainingGroupCancellationPolicy` selects the newest training groups
+and excludes evaluation. Every live repetition in a selected group is cancelled and cleaned up, the partial results are
+discarded, and the complete group is retried behind the lower request limit. Hosted transports that cannot cancel
+in-flight requests apply only the new admission limit.
 
 ## Policies
 
@@ -214,8 +218,9 @@ implementation thresholds rather than exposing another tuning surface:
 - preemptions or a persistent capacity queue make a larger cut and hold further cuts while the pool drains;
 - incomplete or stale metric snapshots never authorize growth.
 
-The initial, minimum, and maximum limits remain configuration. Active cancellation is deliberately disabled in v1, so
-even a hard KV trim returns `shed_count=0` on the built-in native path.
+The initial, minimum, and maximum limits remain configuration. On non-batched native generation, hard KV trims,
+preemptions, and persistent capacity queues can request active group shedding. Soft KV trims still drain naturally;
+batched generation has no independently cancellable trajectory tasks and also drains naturally.
 
 ## Backend mappings
 
@@ -249,10 +254,12 @@ This request gate applies to synchronous, one-step asynchronous, and fully async
 standard paths converge on the same generator and client. `_AsyncStalenessManager` remains a separate algorithmic gate
 over complete prompt groups in fully async training; its group count is not the physical sampling limit.
 
-Selective shedding additionally requires cancellable per-episode `agent_loop()` tasks and an in-flight trajectory
-registry in `SkyRLGymGenerator`. The long-lived fully async generator worker loop and its complete prompt-group slot must
-not be cancelled because training consumes groups atomically. Until that exists, hard pressure closes request admission
-but cannot immediately reclaim KV held by already-running multi-turn trajectories.
+For non-batched generation, `SkyRLGymGenerator` registers each `agent_loop()` task under the `TrajectoryID.instance_id`
+prompt group. A hard decision selects the youngest training groups until it covers `shed_count`, cancels every live
+repetition in each selected group, waits for environment and inference-session cleanup, and retries the complete group.
+This preserves GRPO group cardinality and prevents `CancelledError` from escaping into the long-lived fully async worker
+or releasing its `_AsyncStalenessManager` slot prematurely. Evaluation shares the request limiter but is not selected
+for adaptive shedding. The batched path has one indivisible engine call and therefore only drains.
 
 ### Fireworks
 
@@ -329,10 +336,11 @@ to make adaptation useful and remains a possible follow-up.
 
 ## Follow-up integration work
 
-1. Add per-episode child tasks, an in-flight registry, and cancellation accounting for fully async trajectory shedding.
-2. Add P/D role attribution before allowing `engine_load` with disaggregated prefill/decode servers.
-3. Decide whether custom generators that bypass `RemoteInferenceClient.generate()` need an admission-aware OpenAI
+1. Add P/D role attribution before allowing `engine_load` with disaggregated prefill/decode servers.
+2. Decide whether custom generators that bypass `RemoteInferenceClient.generate()` need an admission-aware OpenAI
    transport or a proxy-level gate, based on actual users of those integrations.
+3. Add request-to-trajectory affinity if a future shedding policy must prefer groups currently holding model-request
+   slots rather than using group age as the available approximation.
 
 Distributed controller ownership is intentionally deferred because SkyRL currently has one process owning native
 generation admission and one `TinkerEngine` owning durable dispatch. Train/eval fairness and remote backend model
