@@ -19,6 +19,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Generic, Literal, Protocol, TypeVar, cast
 
+from loguru import logger
+
 from skyrl.backends.skyrl_train.inference_servers.base import (
     InferenceEngineInput,
     InferenceEngineInterface,
@@ -293,6 +295,14 @@ class SamplingService:
     def _apply_decision(self, decision: ConcurrencyDecision) -> None:
         """Cancel the youngest distinct dispatched attempts selected by a hard cut."""
 
+        logger.info(
+            "Sampling concurrency decision: limit={} reason={} shed_count={} in_flight={} pending={}",
+            decision.desired_limit,
+            decision.reason,
+            decision.shed_count,
+            self.in_flight,
+            self.pending,
+        )
         if decision.shed_count < 1:
             return
         candidates = sorted(
