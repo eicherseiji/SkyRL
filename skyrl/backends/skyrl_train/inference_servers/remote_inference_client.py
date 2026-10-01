@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
@@ -60,6 +61,7 @@ from typing import (
     Required,
     Tuple,
     TypedDict,
+    TypeVar,
     Union,
 )
 
@@ -104,6 +106,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+_SamplingResultT = TypeVar("_SamplingResultT")
 
 
 def _extract_session_id_and_body(
@@ -282,6 +286,23 @@ class RemoteInferenceClient(InferenceEngineInterface):
             self._sem_loop = current_loop
         return self._gen_sem, self._detok_sem
 
+    async def _run_sampling_request(
+        self,
+        request: Callable[[], Awaitable[_SamplingResultT]],
+    ) -> _SamplingResultT:
+        """Run one physical request through the legacy hard safety cap.
+
+        Adaptive queueing lives in the run-scoped ``SamplingService``.  This
+        semaphore remains a backend-local ceiling for deployments that already
+        configure ``SKYRL_GENERATE_CONCURRENCY_PER_ENGINE``.
+        """
+
+        generation_semaphore, _ = self._get_semaphores()
+        if generation_semaphore is None:
+            return await request()
+        async with generation_semaphore:
+            return await request()
+
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create the aiohttp session."""
         # Re-use the existing session object if it is not closed.
@@ -408,39 +429,28 @@ class RemoteInferenceClient(InferenceEngineInterface):
         cache_salt = input_batch.get("cache_salt")
         get_logprobs = sampling_params.get("logprobs") is not None
 
-        # Two semaphores decouple the generate and detokenize stages:
-        #   gen_sem:   limits concurrent in-flight generate requests so we don't
-        #              overwhelm the router/vLLM scheduler.  Released as soon as
-        #              generation finishes, so the GPU slot is freed immediately.
-        #   detok_sem: limits concurrent detokenize calls independently.  Uses the
-        #              same concurrency limit so detokenize never starves generate.
-        # Semaphores are shared across all concurrent generate() calls on this client
-        # instance, so total in-flight requests are capped at
-        # SKYRL_GENERATE_CONCURRENCY_PER_ENGINE × num_engines regardless of how many
-        # callers invoke generate() simultaneously.
-        # TODO (sumanthrh) (RemoteInferenceClient data-plane-deprecation): We should move this outside of the client to a runner abstraction that will also parallelize client requests across processes.
-        gen_sem, detok_sem = self._get_semaphores()
+        # Admission is shared across every generate() caller on this long-lived
+        # client. Detokenization remains separately capped after the GPU request
+        # releases its adaptive slot.
+        _, detok_sem = self._get_semaphores()
         batch_size = len(prompt_token_ids)
 
-        async def _throttled_generate(idx: int) -> Dict[str, Any]:
-            if gen_sem is None:
+        async def _generate_one(idx: int) -> Dict[str, Any]:
+            prompt_ids = prompt_token_ids[idx]
+            session_id = session_ids[idx] if session_ids and idx < len(session_ids) else None
+            features = mm_features[idx] if mm_features and idx < len(mm_features) else None
+
+            async def _call() -> Dict[str, Any]:
                 return await self._generate_single(
-                    prompt_token_ids=prompt_token_ids[idx],
+                    prompt_token_ids=prompt_ids,
                     sampling_params=sampling_params,
-                    session_id=session_ids[idx] if session_ids and idx < len(session_ids) else None,
-                    mm_features=mm_features[idx] if mm_features and idx < len(mm_features) else None,
+                    session_id=session_id,
+                    mm_features=features,
                     model=model,
                     cache_salt=cache_salt,
                 )
-            async with gen_sem:
-                return await self._generate_single(
-                    prompt_token_ids=prompt_token_ids[idx],
-                    sampling_params=sampling_params,
-                    session_id=session_ids[idx] if session_ids and idx < len(session_ids) else None,
-                    mm_features=mm_features[idx] if mm_features and idx < len(mm_features) else None,
-                    model=model,
-                    cache_salt=cache_salt,
-                )
+
+            return await self._run_sampling_request(_call)
 
         async def _throttled_detokenize(token_ids: List[int]) -> str:
             if detok_sem is None:
@@ -448,7 +458,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
             async with detok_sem:
                 return (await self.detokenize([token_ids]))[0]
 
-        raw_results = await asyncio.gather(*[_throttled_generate(idx) for idx in range(batch_size)])
+        raw_results = await asyncio.gather(*[_generate_one(idx) for idx in range(batch_size)])
         responses = await asyncio.gather(*[_throttled_detokenize(r["response_ids"]) for r in raw_results])
 
         rollout_expert_indices = (
@@ -684,12 +694,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
             headers["X-Session-ID"] = str(session_id)
 
         url = f"{self.proxy_url}/inference/v1/generate"
-        gen_sem, _ = self._get_semaphores()
-        if gen_sem is None:
-            response = await self._post(url, json=payload, headers=headers)
-        else:
-            async with gen_sem:
-                response = await self._post(url, json=payload, headers=headers)
+
+        async def _call() -> Any:
+            return await self._post(url, json=payload, headers=headers)
+
+        response = await self._run_sampling_request(_call)
 
         # vLLM returns: list[dict[str(token_id) → {"logprob": float, ...}] | None]
         result_prompt_logprobs: Optional[List[Optional[float]]] = None
@@ -753,12 +762,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
             headers["X-Session-ID"] = str(session_id)
 
         url = f"{self.proxy_url}/v1/chat/completions"
-        gen_sem, _ = self._get_semaphores()
-        if gen_sem is None:
+
+        async def _call() -> Dict[str, Any]:
             return await self._post(url, json=body, headers=headers)
-        else:
-            async with gen_sem:
-                return await self._post(url, json=body, headers=headers)
+
+        return await self._run_sampling_request(_call)
 
     async def render_chat_completion(
         self,
@@ -817,12 +825,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
             headers["X-Session-ID"] = str(session_id)
 
         url = f"{self.proxy_url}/v1/completions"
-        gen_sem, _ = self._get_semaphores()
-        if gen_sem is None:
+
+        async def _call() -> Dict[str, Any]:
             return await self._post(url, json=body, headers=headers)
-        else:
-            async with gen_sem:
-                return await self._post(url, json=body, headers=headers)
+
+        return await self._run_sampling_request(_call)
 
     async def tokenize(
         self,

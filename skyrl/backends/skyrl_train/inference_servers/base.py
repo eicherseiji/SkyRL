@@ -53,7 +53,6 @@ class InferenceEngineOutput(TypedDict):
 
 
 class InferenceEngineInterface(ABC):
-
     @property
     @abstractmethod
     def model_name(self) -> str:
