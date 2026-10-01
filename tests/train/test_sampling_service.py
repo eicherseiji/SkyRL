@@ -3,10 +3,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from skyrl.train.sampling_service import SamplingClient, SamplingService
+from skyrl.train.sampling_service import SamplingClient, SamplingService, TrajectoryShed
 from skyrl.utils.adaptive_concurrency import (
+    ConcurrencyDecision,
     FixedConcurrencyPolicy,
     SamplingConcurrencyController,
+    SamplingFeedback,
 )
 
 
@@ -105,3 +107,51 @@ async def test_client_cancellation_cancels_service_owned_backend_work():
     assert service.pending == 0
     assert service.in_flight == 0
     assert controller.in_flight == 0
+
+
+@pytest.mark.asyncio
+async def test_hard_pressure_sheds_youngest_dispatched_attempt_and_blocks_it_until_cleanup():
+    class HardPressurePolicy:
+        def on_feedback(self, feedback, context):
+            return ConcurrencyDecision(desired_limit=1, reason="engine_preemptions", shed_count=1)
+
+        def on_completion(self, completion, context):
+            return None
+
+    backend = MagicMock()
+    started = {attempt_id: asyncio.Event() for attempt_id in ("old", "young", "replacement")}
+    release = {attempt_id: asyncio.Event() for attempt_id in ("old", "young", "replacement")}
+
+    async def chat_completion(payload):
+        attempt_id = payload["json"]["session_id"]
+        started[attempt_id].set()
+        await release[attempt_id].wait()
+        return {"id": attempt_id}
+
+    backend.chat_completion = chat_completion
+    controller = SamplingConcurrencyController(policy=HardPressurePolicy(), initial_limit=2)
+    service = SamplingService(backend, controller=controller)
+
+    old = asyncio.create_task(service.chat_completion({"json": {"session_id": "old"}}, attempt_id="old"))
+    await started["old"].wait()
+    young = asyncio.create_task(service.chat_completion({"json": {"session_id": "young"}}, attempt_id="young"))
+    await started["young"].wait()
+
+    await controller.on_feedback(SamplingFeedback())
+
+    with pytest.raises(TrajectoryShed, match="young"):
+        await young
+    assert not old.done()
+    with pytest.raises(TrajectoryShed, match="young"):
+        await service.chat_completion({"json": {"session_id": "young"}}, attempt_id="young")
+
+    release["old"].set()
+    assert await old == {"id": "old"}
+
+    await service.finish_attempt("young")
+    replacement = asyncio.create_task(
+        service.chat_completion({"json": {"session_id": "replacement"}}, attempt_id="replacement")
+    )
+    await started["replacement"].wait()
+    release["replacement"].set()
+    assert await replacement == {"id": "replacement"}
