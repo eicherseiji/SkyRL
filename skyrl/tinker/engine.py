@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from cloudpathlib import AnyPath
 from pydantic import BaseModel
@@ -36,10 +36,16 @@ from skyrl.tinker.extra import (
     SkyRLTrainInferenceForwardingClient,
 )
 from skyrl.utils.adaptive_concurrency import (
+    ConcurrencyDecision,
+    EngineLoadConcurrencyPolicy,
     FixedConcurrencyPolicy,
+    SamplingCompletion,
     SamplingConcurrencyController,
 )
 from skyrl.utils.log import logger
+
+if TYPE_CHECKING:
+    from skyrl.train.utils.vllm_metrics_scraper import VLLMEngineFeedbackProducer
 
 _MAX_IDS_PER_QUERY = 500
 
@@ -49,7 +55,35 @@ class _DispatchedExternalSample:
     """Transient execution handle for one durable DISPATCHED sample row."""
 
     request_id: int
+    submitted_at_s: float
     task: asyncio.Task[None]
+
+
+def _make_sampling_concurrency_controller(
+    config: EngineConfig, *, uses_managed_vllm: bool
+) -> SamplingConcurrencyController | None:
+    settings = config.sampling_concurrency
+    if not settings.enabled:
+        return None
+    if settings.policy == "fixed":
+        policy = FixedConcurrencyPolicy()
+    elif settings.policy == "engine_load":
+        if not uses_managed_vllm:
+            raise ValueError("sampling_concurrency.policy='engine_load' requires SkyRL-managed vLLM")
+        backend_cfg = config.backend_config or {}
+        if not backend_cfg.get("generator.inference_engine.enable_ray_prometheus_stats", True):
+            raise ValueError(
+                "sampling_concurrency.policy='engine_load' requires "
+                "generator.inference_engine.enable_ray_prometheus_stats=true"
+            )
+        if backend_cfg.get("generator.inference_engine.enable_pd", False):
+            raise ValueError(
+                "sampling_concurrency.policy='engine_load' does not yet support prefill/decode role attribution"
+            )
+        policy = EngineLoadConcurrencyPolicy(min_limit=settings.min_limit, max_limit=settings.max_limit)
+    else:
+        raise ValueError(f"Unknown sampling concurrency policy: {settings.policy}")
+    return SamplingConcurrencyController(policy=policy, initial_limit=settings.initial_limit)
 
 
 def _model_not_found_error(model_id: str) -> types.ErrorResponse:
@@ -290,30 +324,35 @@ class TinkerEngine:
         backend_config = backend_config_class(**config.backend_config)
         self.backend = backend_class(config.base_model, backend_config)
 
-        settings = config.sampling_concurrency
-        self.sampling_concurrency_controller = (
-            SamplingConcurrencyController(
-                policy=FixedConcurrencyPolicy(),
-                initial_limit=settings.initial_limit,
-            )
-            if settings.enabled
-            else None
-        )
-        self._external_samples: dict[int, _DispatchedExternalSample] = {}
-        self._forwarding_client = None
-        self._forwarding_loop: asyncio.AbstractEventLoop | None = None
-
         backend_cfg = config.backend_config or {}
         is_colocated = bool(backend_cfg.get("trainer.placement.colocate_all", True))
         uses_managed_vllm = (
             not config.external_inference_url and config.backend in ("megatron", "fsdp") and not is_colocated
         )
-        if config.external_inference_url or uses_managed_vllm:
+        forwards_external_samples = bool(config.external_inference_url) or uses_managed_vllm
+
+        self.sampling_concurrency_controller = _make_sampling_concurrency_controller(
+            config, uses_managed_vllm=uses_managed_vllm
+        )
+        self._external_samples: dict[int, _DispatchedExternalSample] = {}
+        self._forwarding_client = None
+        self._forwarding_loop: asyncio.AbstractEventLoop | None = None
+        self._vllm_feedback_producer: VLLMEngineFeedbackProducer | None = None
+        self._active_feedback_url: str | None = None
+        self._managed_vllm_proxy_url: str | None = None
+        self._managed_vllm_feedback_enabled = (
+            uses_managed_vllm
+            and self.sampling_concurrency_controller is not None
+            and isinstance(self.sampling_concurrency_controller.policy, EngineLoadConcurrencyPolicy)
+        )
+        if forwards_external_samples:
             async_db_engine = create_async_engine(get_async_database_url(config.database_url), echo=False)
             client_type = (
                 ExternalInferenceClient if config.external_inference_url else SkyRLTrainInferenceForwardingClient
             )
             self._forwarding_client = client_type(config, async_db_engine)
+            if self.sampling_concurrency_controller is not None:
+                self.sampling_concurrency_controller.set_decision_handler(self._on_sampling_concurrency_decision)
 
         self._recover_dispatched_samples()
 
@@ -359,6 +398,41 @@ class TinkerEngine:
             row.updated_at = datetime.now(timezone.utc)
             session.add(row)
             session.commit()
+        self._schedule_managed_vllm_feedback(proxy_url)
+
+    def _schedule_managed_vllm_feedback(self, proxy_url: str | None) -> None:
+        self._managed_vllm_proxy_url = proxy_url
+        if not self._managed_vllm_feedback_enabled or self._forwarding_loop is None:
+            return
+        loop = self._forwarding_loop
+        loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(
+                self._replace_managed_vllm_feedback_producer(proxy_url),
+                name="tinker-vllm-feedback-reconfigure",
+            )
+        )
+
+    async def _replace_managed_vllm_feedback_producer(self, proxy_url: str | None) -> None:
+        """Keep the shared vLLM producer aligned with the current endpoint."""
+
+        if proxy_url == self._active_feedback_url and self._vllm_feedback_producer is not None:
+            return
+        if self._vllm_feedback_producer is not None:
+            await self._vllm_feedback_producer.aclose()
+            self._vllm_feedback_producer = None
+            self._active_feedback_url = None
+        if proxy_url is None:
+            return
+        from skyrl.train.utils.vllm_metrics_scraper import VLLMEngineFeedbackProducer
+
+        assert self.sampling_concurrency_controller is not None
+        producer = VLLMEngineFeedbackProducer(
+            self.sampling_concurrency_controller,
+            model_server_urls=[proxy_url],
+        )
+        self._vllm_feedback_producer = producer
+        self._active_feedback_url = proxy_url
+        producer.start()
 
     @contextmanager
     def _checkpoint_status_context(self, model_id: str, checkpoint_id: str, checkpoint_type: types.CheckpointType):
@@ -965,13 +1039,16 @@ class TinkerEngine:
                     )
                     return
                 async with controller.slot():
-                    await self._forwarding_client.call_and_store_result(
+                    started_at_s = time.monotonic()
+                    succeeded = await self._forwarding_client.call_and_store_result(
                         numeric_request_id,
                         request_data,
                         model_id,
                         request_data.checkpoint_id,
                         base_model=request_data.base_model,
                     )
+                if succeeded:
+                    await controller.on_completion(SamplingCompletion(duration_s=time.monotonic() - started_at_s))
             except Exception:
                 # The forwarding clients persist ordinary inference failures as
                 # FAILED. Requeue only unexpected task crashes (for example a DB
@@ -981,7 +1058,11 @@ class TinkerEngine:
 
         def start() -> None:
             task = asyncio.create_task(execute(), name=f"tinker-external-sample-{request_id}")
-            dispatched = _DispatchedExternalSample(request_id=numeric_request_id, task=task)
+            dispatched = _DispatchedExternalSample(
+                request_id=numeric_request_id,
+                submitted_at_s=time.monotonic(),
+                task=task,
+            )
             self._external_samples[numeric_request_id] = dispatched
 
             def finish(completed: asyncio.Task[None]) -> None:
@@ -993,6 +1074,38 @@ class TinkerEngine:
             task.add_done_callback(finish)
 
         self._forwarding_loop.call_soon_threadsafe(start)
+
+    def _on_sampling_concurrency_decision(self, decision: ConcurrencyDecision) -> None:
+        if decision.shed_count < 1 or self._forwarding_loop is None:
+            return
+        self._forwarding_loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(
+                self._shed_external_samples(decision.shed_count, reason=decision.reason),
+                name="tinker-external-sample-shedding",
+            )
+        )
+
+    async def _shed_external_samples(self, shed_count: int, *, reason: str) -> None:
+        """Cancel the youngest dispatched requests and return them to the queue."""
+
+        selected = sorted(
+            (work for work in self._external_samples.values() if not work.task.done()),
+            key=lambda work: work.submitted_at_s,
+            reverse=True,
+        )[:shed_count]
+        for work in selected:
+            work.task.cancel()
+        if not selected:
+            return
+        await asyncio.gather(*(work.task for work in selected), return_exceptions=True)
+        request_ids = [work.request_id for work in selected]
+        requeued = await asyncio.to_thread(self._requeue_external_samples, request_ids)
+        logger.warning(
+            "Adaptive sampling cancelled %s dispatched requests and requeued %s (reason=%s)",
+            len(selected),
+            requeued,
+            reason,
+        )
 
     def process_external_samples(self) -> None:
         """Continuously dispatch durable external sample requests."""
@@ -1054,6 +1167,7 @@ class TinkerEngine:
                 self._forwarding_loop.run_forever()
 
             threading.Thread(target=run_forwarding_loop, name="tinker-sampling-forwarding", daemon=True).start()
+            self._schedule_managed_vllm_feedback(self._managed_vllm_proxy_url)
             threading.Thread(target=self.process_external_samples, name="tinker-sampling-dispatch", daemon=True).start()
         logger.info("Starting background engine...")
         self.process_pending_requests()
