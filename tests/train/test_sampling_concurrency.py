@@ -29,7 +29,6 @@ def test_builds_service_owned_engine_load_controller():
     ("field", "message"),
     [
         ("run_engines_locally", "requires SkyRL-managed local vLLM"),
-        ("enable_ray_prometheus_stats", "requires.*enable_ray_prometheus_stats"),
         ("enable_pd", "does not yet support prefill/decode"),
     ],
 )
@@ -39,13 +38,23 @@ def test_rejects_engine_load_without_coherent_managed_vllm_metrics(field, messag
     config.sampling_concurrency.policy = "engine_load"
     if field == "run_engines_locally":
         config.inference_engine.run_engines_locally = False
-    elif field == "enable_ray_prometheus_stats":
-        config.inference_engine.enable_ray_prometheus_stats = False
     else:
         config.inference_engine.enable_pd = True
 
     with pytest.raises(ValueError, match=message):
         build_sampling_concurrency_controller(config)
+
+
+def test_engine_load_does_not_depend_on_ray_prometheus_export():
+    config = GeneratorConfig()
+    config.sampling_concurrency.enabled = True
+    config.sampling_concurrency.policy = "engine_load"
+    config.inference_engine.enable_ray_prometheus_stats = False
+
+    controller = build_sampling_concurrency_controller(config)
+
+    assert controller is not None
+    assert isinstance(controller.policy, EngineLoadConcurrencyPolicy)
 
 
 def test_builds_lightweight_client_around_service_even_when_adaptive_control_is_disabled():

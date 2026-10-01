@@ -24,14 +24,7 @@ def build_sampling_concurrency_controller(
         policy = FixedConcurrencyPolicy()
     elif concurrency_cfg.policy == "engine_load":
         if not generator_cfg.inference_engine.run_engines_locally:
-            raise ValueError(
-                "sampling concurrency policy 'engine_load' requires SkyRL-managed local vLLM engines"
-            )
-        if not generator_cfg.inference_engine.enable_ray_prometheus_stats:
-            raise ValueError(
-                "sampling concurrency policy 'engine_load' requires "
-                "generator.inference_engine.enable_ray_prometheus_stats=true"
-            )
+            raise ValueError("sampling concurrency policy 'engine_load' requires SkyRL-managed local vLLM engines")
         if generator_cfg.inference_engine.enable_pd:
             raise ValueError(
                 "sampling concurrency policy 'engine_load' does not yet support prefill/decode role attribution"

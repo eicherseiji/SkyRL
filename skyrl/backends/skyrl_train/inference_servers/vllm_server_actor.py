@@ -544,10 +544,15 @@ async def _build_and_serve_vllm_server(
 
     stat_loggers = None
     if enable_ray_prometheus_stats:
+        from vllm.v1.metrics.loggers import PrometheusStatLogger
         from vllm.v1.metrics.ray_wrappers import RayPrometheusStatLogger
 
-        logger.info("Enabling RayPrometheusStatLogger for vLLM engine metrics")
-        stat_loggers = [RayPrometheusStatLogger]
+        logger.info("Enabling native and Ray Prometheus loggers for vLLM engine metrics")
+        # Supplying a PrometheusStatLogger subclass disables vLLM's implicit
+        # native logger. Keep both sinks explicit: Ray export is useful for
+        # cluster observability, while adaptive admission scrapes the owning
+        # server directly so feedback is not coupled to Ray's dashboard agent.
+        stat_loggers = [RayPrometheusStatLogger, PrometheusStatLogger]
 
     engine = AsyncLLMEngine.from_engine_args(
         engine_args=engine_args,

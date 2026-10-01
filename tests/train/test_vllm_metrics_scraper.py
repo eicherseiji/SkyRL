@@ -236,6 +236,56 @@ async def test_vllm_feedback_producer_pushes_scrape_into_controller():
 
 
 @pytest.mark.asyncio
+async def test_native_vllm_metrics_are_normalized_and_kept_distinct_by_server():
+    urls = ["http://engine-a/metrics", "http://engine-b/metrics"]
+    scraper = VLLMMetricsScraper(urls=urls)
+
+    def native_snapshot(running: int) -> str:
+        labels = 'engine="0",model_name="test"'
+        return "\n".join(
+            [
+                f"vllm:num_requests_running{{{labels}}} {running}",
+                f"vllm:num_requests_waiting{{{labels}}} 3",
+                f"vllm:kv_cache_usage_perc{{{labels}}} 0.25",
+                f"vllm:num_preemptions_total{{{labels}}} 0",
+            ]
+        )
+
+    payloads = {
+        urls[0]: native_snapshot(1),
+        urls[1]: native_snapshot(2),
+    }
+
+    async def fake_fetch_one(_client, url):
+        return payloads[url]
+
+    with patch.object(scraper, "_fetch_one", fake_fetch_one):
+        feedback = await scraper.engine_feedback()
+
+    assert isinstance(feedback, VLLMEngineSamplingFeedback)
+    assert len(feedback.engine_loads) == 2
+    assert {load.engine_id for load in feedback.engine_loads} == {
+        "http://engine-a/metrics.0",
+        "http://engine-b/metrics.0",
+    }
+    assert {load.running for load in feedback.engine_loads} == {1, 2}
+    await scraper.aclose()
+
+
+def test_feedback_producer_scrapes_native_model_server_endpoints():
+    controller = SamplingConcurrencyController(policy=FixedConcurrencyPolicy(), initial_limit=1)
+    producer = VLLMEngineFeedbackProducer(
+        controller,
+        model_server_urls=["http://engine-a/", "http://engine-b"],
+    )
+
+    assert producer._scraper._urls == [
+        "http://engine-a/metrics",
+        "http://engine-b/metrics",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_scraper_first_call_emits_only_gauges():
     scraper = VLLMMetricsScraper(urls=["http://stub/metrics"])
     text = _snapshot(

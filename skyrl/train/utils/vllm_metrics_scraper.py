@@ -1,10 +1,10 @@
-"""Scrape vLLM engine metrics from Ray's per-node metrics agents.
+"""Scrape vLLM engine metrics from native servers or Ray metrics agents.
 
-When ``generator.inference_engine.enable_ray_prometheus_stats=true``, the vLLM
-engines record their metrics through ``ray.util.metrics`` (via vLLM's
-``RayPrometheusStatLogger``), and Ray's metrics agent on each node exposes them
-in Prometheus text format.  This module scrapes those endpoints once per
-training step and reduces a small fixed subset to scalars suitable for wandb.
+Adaptive admission reads each managed vLLM server's native ``/metrics``
+endpoint. Training telemetry can also discover Ray's per-node metrics agents
+when ``generator.inference_engine.enable_ray_prometheus_stats=true``. This
+module normalizes both Prometheus namespaces and reduces a fixed subset to
+scalars suitable for control feedback or wandb.
 
 Counters are summed across replicas; gauges are averaged.  Rates and average
 latencies are derived from deltas vs. the previous sample.
@@ -120,6 +120,20 @@ def parse_metrics_text(text: str) -> ParsedSamples:
         )
         out[(m.group("name"), labels)] = value
     return out
+
+
+def _canonical_metric_name(name: str) -> str:
+    """Normalize native vLLM names to the existing Ray-exported namespace.
+
+    vLLM's own endpoint exports ``vllm:num_requests_running`` while Ray's
+    OpenTelemetry bridge exports ``ray_vllm_num_requests_running``. Keeping one
+    internal namespace lets the same reduction and typed-feedback code consume
+    either transport.
+    """
+
+    if name.startswith("vllm:"):
+        return f"ray_{name.replace(':', '_')}"
+    return name
 
 
 def aggregate(parsed: ParsedSamples, names: Iterable[str], how: str) -> Dict[str, float]:
@@ -245,12 +259,20 @@ class VLLMMetricsScraper:
         client = await self._get_client()
         texts = await asyncio.gather(*(self._fetch_one(client, u) for u in self._urls))
         merged: ParsedSamples = {}
-        for text in texts:
+        for url, text in zip(self._urls, texts):
             if not text:
                 continue
-            for key, value in parse_metrics_text(text).items():
-                # Same (name, labels) tuple should not appear on two nodes for
-                # vLLM metrics (ReplicaId is unique), so last-wins is safe.
+            for (name, labels), value in parse_metrics_text(text).items():
+                is_native_vllm = name.startswith("vllm:")
+                name = _canonical_metric_name(name)
+                if is_native_vllm:
+                    # Native endpoints use engine indexes local to each server.
+                    # Add the scrape target so two servers' ``engine=0`` series
+                    # remain distinct when their payloads are merged.
+                    labels = frozenset((*labels, ("ScrapeTarget", url)))
+                key = (name, labels)
+                # Native series include ScrapeTarget and Ray series include a
+                # unique ReplicaId, so last-wins is safe for identical keys.
                 merged[key] = value
         return merged
 
@@ -264,11 +286,7 @@ class VLLMMetricsScraper:
 
         parsed = await self._fetch_all()
         if not parsed and not self._warned_empty:
-            logger.warning(
-                "VLLMMetricsScraper: scraped Ray metrics agents but found no "
-                "samples; check that engines were started with "
-                "enable_ray_prometheus_stats=true."
-            )
+            logger.warning("VLLMMetricsScraper: configured endpoints returned no usable vLLM metric samples.")
             self._warned_empty = True
 
         sums = aggregate(parsed, _SUM_METRICS, how="sum")
@@ -538,10 +556,12 @@ class VLLMEngineFeedbackProducer:
     ) -> None:
         if poll_interval_s <= 0:
             raise ValueError(f"poll_interval_s must be positive, got {poll_interval_s}")
+        self._model_server_urls = model_server_urls or []
         self._controller = controller
         self._poll_interval_s = poll_interval_s
-        self._scraper = scraper or VLLMMetricsScraper()
-        self._model_server_urls = model_server_urls or []
+        self._scraper = scraper or VLLMMetricsScraper(
+            urls=[f"{url.rstrip('/')}/metrics" for url in self._model_server_urls]
+        )
         self._max_model_len: Optional[int] = None
         self._model_metadata_probed = False
         self._task: Optional[asyncio.Task[None]] = None
@@ -615,7 +635,11 @@ def _engine_id(labels: Dict[str, str]) -> Optional[str]:
     """Build a stable identity from Ray's replica/worker and vLLM engine labels."""
 
     owner = next(
-        (labels.get(name) for name in ("ReplicaId", "WorkerId", "ActorId", "instance") if labels.get(name)),
+        (
+            labels.get(name)
+            for name in ("ReplicaId", "WorkerId", "ActorId", "instance", "ScrapeTarget")
+            if labels.get(name)
+        ),
         None,
     )
     engine = labels.get("engine")
