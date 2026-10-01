@@ -45,28 +45,28 @@ def test_sampling_policy_is_adaptive_only_for_managed_vllm():
         _make_sampling_concurrency_controller(adaptive, uses_managed_vllm=False)
 
 
-@pytest.mark.parametrize(
-    ("backend_config", "message"),
-    [
-        (
-            {"generator.inference_engine.enable_ray_prometheus_stats": False},
-            "requires.*enable_ray_prometheus_stats",
-        ),
-        (
-            {"generator.inference_engine.enable_pd": True},
-            "does not yet support prefill/decode",
-        ),
-    ],
-)
-def test_engine_load_policy_rejects_incompatible_managed_vllm_metrics(backend_config, message):
+def test_engine_load_policy_rejects_pd_role_ambiguity():
     config = EngineConfig(
         base_model=BASE_MODEL,
-        backend_config=backend_config,
+        backend_config={"generator.inference_engine.enable_pd": True},
         sampling_concurrency={"enabled": True, "policy": "engine_load"},
     )
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="does not yet support prefill/decode"):
         _make_sampling_concurrency_controller(config, uses_managed_vllm=True)
+
+
+def test_engine_load_policy_does_not_depend_on_ray_prometheus_export():
+    config = EngineConfig(
+        base_model=BASE_MODEL,
+        backend_config={"generator.inference_engine.enable_ray_prometheus_stats": False},
+        sampling_concurrency={"enabled": True, "policy": "engine_load"},
+    )
+
+    controller = _make_sampling_concurrency_controller(config, uses_managed_vllm=True)
+
+    assert controller is not None
+    assert isinstance(controller.policy, EngineLoadConcurrencyPolicy)
 
 
 @pytest.mark.asyncio
@@ -95,17 +95,17 @@ async def test_managed_vllm_feedback_producer_tracks_endpoint_changes(monkeypatc
         policy=FixedConcurrencyPolicy(), initial_limit=1
     )
     engine._vllm_feedback_producer = None
-    engine._active_feedback_url = None
+    engine._active_feedback_urls = ()
 
-    await engine._replace_managed_vllm_feedback_producer("http://first")
-    await engine._replace_managed_vllm_feedback_producer("http://second")
+    await engine._replace_managed_vllm_feedback_producer(("http://first",))
+    await engine._replace_managed_vllm_feedback_producer(("http://second",))
 
     assert producers[0].started
     assert producers[0].closed
     assert producers[1].started
     assert producers[1].model_server_urls == ["http://second"]
 
-    await engine._replace_managed_vllm_feedback_producer(None)
+    await engine._replace_managed_vllm_feedback_producer(())
     assert producers[1].closed
     assert engine._vllm_feedback_producer is None
 
