@@ -25,6 +25,7 @@ from skyrl.backends.skyrl_train.inference_servers.base import (
     InferenceEngineOutput,
 )
 from skyrl.utils.adaptive_concurrency import (
+    ConcurrencyDecision,
     SamplingCompletion,
     SamplingConcurrencyController,
 )
@@ -48,6 +49,15 @@ class SamplingRequest:
     model: str | None = None
 
 
+class TrajectoryShed(RuntimeError):
+    """A hard-pressure decision terminated one rollout at a sampling boundary."""
+
+    def __init__(self, attempt_id: str, reason: str) -> None:
+        self.attempt_id = attempt_id
+        self.reason = reason
+        super().__init__(f"trajectory {attempt_id!r} shed because of {reason}")
+
+
 class SamplingFeedbackProducer(Protocol):
     """Lifecycle shared by service-owned backend feedback producers."""
 
@@ -65,6 +75,7 @@ class _SamplingWork(Generic[_ResultT]):
     completion: asyncio.Future[_ResultT]
     task: asyncio.Task[None] | None = None
     dispatched_at_s: float | None = None
+    shed_reason: str | None = None
 
 
 class SamplingService:
@@ -90,8 +101,12 @@ class SamplingService:
         self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._owner_ready = threading.Event()
         self._http_proxy = None
+        self._revoked_attempts: dict[str, str] = {}
+        self._attempt_started_at_s: dict[str, float] = {}
         self._started = False
         self._closed = False
+        if self._controller is not None:
+            self._controller.set_decision_handler(self._apply_decision)
 
     @property
     def controller(self) -> SamplingConcurrencyController | None:
@@ -211,6 +226,11 @@ class SamplingService:
         invoke: Callable[[], Awaitable[_ResultT]],
     ) -> _ResultT:
         self.start()
+        if attempt_id is not None and attempt_id in self._revoked_attempts:
+            raise TrajectoryShed(attempt_id, self._revoked_attempts[attempt_id])
+        submitted_at_s = time.monotonic()
+        if attempt_id is not None:
+            self._attempt_started_at_s.setdefault(attempt_id, submitted_at_s)
         loop = asyncio.get_running_loop()
         request_id = uuid.uuid4().hex
         completion: asyncio.Future[_ResultT] = loop.create_future()
@@ -218,7 +238,7 @@ class SamplingService:
             request_id=request_id,
             operation=operation,
             attempt_id=attempt_id,
-            submitted_at_s=time.monotonic(),
+            submitted_at_s=submitted_at_s,
             completion=completion,
         )
         self._work[request_id] = work
@@ -228,8 +248,7 @@ class SamplingService:
             return await completion
         except asyncio.CancelledError:
             # A dead generator must not leave an orphan request consuming engine
-            # capacity. Policy-driven shedding is layered on this same ownership
-            # point in the next stack entry.
+            # capacity. Policy-driven shedding uses this same ownership point.
             work.task.cancel()
             await asyncio.gather(work.task, return_exceptions=True)
             raise
@@ -256,7 +275,10 @@ class SamplingService:
             if not work.completion.done():
                 work.completion.set_result(result)
         except asyncio.CancelledError:
-            if not work.completion.done():
+            if work.shed_reason is not None and work.attempt_id is not None:
+                if not work.completion.done():
+                    work.completion.set_exception(TrajectoryShed(work.attempt_id, work.shed_reason))
+            elif not work.completion.done():
                 work.completion.cancel()
             raise
         except BaseException as exc:
@@ -268,10 +290,48 @@ class SamplingService:
             _ = succeeded
             self._work.pop(work.request_id, None)
 
+    def _apply_decision(self, decision: ConcurrencyDecision) -> None:
+        """Cancel the youngest distinct dispatched attempts selected by a hard cut."""
+
+        if decision.shed_count < 1:
+            return
+        candidates = sorted(
+            (
+                work
+                for work in self._work.values()
+                if work.attempt_id is not None
+                and work.dispatched_at_s is not None
+                and work.task is not None
+                and not work.task.done()
+            ),
+            key=lambda work: self._attempt_started_at_s[cast(str, work.attempt_id)],
+            reverse=True,
+        )
+        selected_attempts: set[str] = set()
+        for work in candidates:
+            assert work.attempt_id is not None
+            if work.attempt_id in selected_attempts:
+                continue
+            work.shed_reason = decision.reason
+            self._revoked_attempts[work.attempt_id] = decision.reason
+            selected_attempts.add(work.attempt_id)
+            work.task.cancel()
+            if len(selected_attempts) >= decision.shed_count:
+                break
+
+    async def finish_attempt(self, attempt_id: str) -> None:
+        """Forget terminal shed state after generator cleanup completes."""
+
+        attempt_id = str(attempt_id)
+        self._revoked_attempts.pop(attempt_id, None)
+        self._attempt_started_at_s.pop(attempt_id, None)
+
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
+        if self._controller is not None:
+            self._controller.set_decision_handler(None)
         tasks = [work.task for work in self._work.values() if work.task is not None]
         for task in tasks:
             task.cancel()
@@ -419,7 +479,10 @@ class SamplingClient(InferenceEngineInterface):
         return await self._backend.resume_generation()
 
     async def finish_session(self, session_id: str) -> None:
-        return await self._backend.finish_session(session_id)
+        try:
+            return await self._backend.finish_session(session_id)
+        finally:
+            await self._service.finish_attempt(session_id)
 
     async def get_world_size(self) -> tuple[int, int]:
         return await self._backend.get_world_size()
