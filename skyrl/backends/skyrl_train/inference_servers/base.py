@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from skyrl.backends.skyrl_train.weight_sync.transfer_strategy import (
         WeightSyncInitInfo,
     )
+    from skyrl.utils.adaptive_concurrency import SamplingConcurrencyController
 
 MessageType = Dict[str, str]
 ConversationType = List[MessageType]
@@ -53,6 +54,16 @@ class InferenceEngineOutput(TypedDict):
 
 
 class InferenceEngineInterface(ABC):
+    def set_sampling_concurrency_controller(self, controller: "SamplingConcurrencyController") -> bool:
+        """Install client-side admission for physical sampling requests.
+
+        Supporting clients acquire a controller slot before sending each
+        sampling request, release it after the request completes, and publish
+        backend-specific pressure feedback to the same controller. Custom
+        clients return ``False`` until they implement this SDK boundary.
+        """
+
+        return False
 
     @property
     @abstractmethod

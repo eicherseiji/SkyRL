@@ -19,6 +19,10 @@ from skyrl.env_vars import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl.train.config import SkyRLTrainConfig, get_config_as_yaml_str
 from skyrl.train.dataset import PromptDataset
 from skyrl.train.generators.base import GeneratorInterface
+from skyrl.train.sampling_concurrency import (
+    attach_sampling_concurrency,
+    build_sampling_concurrency_controller,
+)
 from skyrl.train.trainer import RayPPOTrainer
 from skyrl.train.utils import validate_cfg
 from skyrl.train.utils.tracking import Tracking
@@ -217,7 +221,10 @@ class BasePPOExp:
             The inference engine client.
         """
         logger.info("Initializing inference client")
-        return self._get_new_inference_client()
+        client = self._get_new_inference_client()
+        controller = build_sampling_concurrency_controller(self.cfg.generator)
+        attach_sampling_concurrency(client, controller)
+        return client
 
     def _get_new_inference_client(self) -> InferenceEngineInterface:
         """New inference client using HTTP endpoints.

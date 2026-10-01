@@ -28,6 +28,11 @@ from skyrl.backends.skyrl_train.inference_servers.setup import (
     build_new_inference_client,
 )
 from skyrl.train.config import SkyRLTrainConfig
+from skyrl.utils.adaptive_concurrency import (
+    EngineLoadConcurrencyPolicy,
+    FixedConcurrencyPolicy,
+    SamplingConcurrencyController,
+)
 
 
 def create_mock_vllm_server(server_id: int) -> FastAPI:
@@ -441,6 +446,20 @@ class TestRemoteInferenceClientInit:
         # Session should be None after unpickling
         assert restored._session is None
 
+    def test_serialization_preserves_sampling_concurrency_controller(self, mock_servers):
+        client = RemoteInferenceClient(
+            proxy_url=mock_servers["proxy_url"],
+            server_urls=mock_servers["server_urls"],
+            data_parallel_size=1,
+        )
+        controller = SamplingConcurrencyController(policy=FixedConcurrencyPolicy(), initial_limit=7)
+        client.set_sampling_concurrency_controller(controller)
+
+        restored = pickle.loads(pickle.dumps(client))
+
+        assert restored._sampling_concurrency_controller is not None
+        assert restored._sampling_concurrency_controller.current_limit == 7
+
 
 class TestDataPlane:
     """Test data plane methods."""
@@ -460,6 +479,81 @@ class TestDataPlane:
         assert all(r == "stop" for r in result["stop_reasons"])
         # response_ids are tokenized from the response
         assert len(result["response_ids"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_engine_load_policy_lazily_starts_vllm_feedback_producer(self, client, monkeypatch):
+        producers = []
+
+        class FakeProducer:
+            def __init__(self, controller, **kwargs):
+                self.controller = controller
+                self.kwargs = kwargs
+                self.starts = 0
+                producers.append(self)
+
+            def start(self):
+                self.starts += 1
+
+            async def aclose(self):
+                return None
+
+        monkeypatch.setattr(
+            "skyrl.train.utils.vllm_metrics_scraper.VLLMEngineFeedbackProducer",
+            FakeProducer,
+        )
+        policy = EngineLoadConcurrencyPolicy(min_limit=1, max_limit=16)
+        controller = SamplingConcurrencyController(policy=policy, initial_limit=4)
+        client.set_sampling_concurrency_controller(controller)
+
+        await client.generate(
+            {
+                "prompt_token_ids": [[1, 2, 3]],
+                "sampling_params": {"max_tokens": 100},
+            }
+        )
+
+        assert len(producers) == 1
+        assert producers[0].controller is controller
+        assert producers[0].kwargs["model_server_urls"] == client.server_urls
+        assert producers[0].starts == 1
+
+    @pytest.mark.asyncio
+    async def test_client_controller_gates_physical_chat_requests(self, client, monkeypatch):
+        controller = SamplingConcurrencyController(policy=FixedConcurrencyPolicy(), initial_limit=1)
+        client.set_sampling_concurrency_controller(controller)
+        first_request_started = asyncio.Event()
+        release_first_request = asyncio.Event()
+        active_requests = 0
+        max_active_requests = 0
+
+        async def blocked_post(url, json, headers=None):
+            nonlocal active_requests, max_active_requests
+            active_requests += 1
+            max_active_requests = max(max_active_requests, active_requests)
+            if not first_request_started.is_set():
+                first_request_started.set()
+                await release_first_request.wait()
+            active_requests -= 1
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        monkeypatch.setattr(client, "_post", blocked_post)
+        payload = {"json": {"messages": [{"role": "user", "content": "hi"}]}}
+
+        first = asyncio.create_task(client.chat_completion(payload))
+        await first_request_started.wait()
+        second = asyncio.create_task(client.chat_completion(payload))
+        await asyncio.sleep(0)
+
+        assert controller.in_flight == 1
+        assert controller.waiting == 1
+        assert max_active_requests == 1
+
+        release_first_request.set()
+        await asyncio.gather(first, second)
+
+        assert controller.in_flight == 0
+        assert controller.waiting == 0
+        assert max_active_requests == 1
 
     @pytest.mark.asyncio
     async def test_generate_with_session_id(self, client):
