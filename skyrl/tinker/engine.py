@@ -71,11 +71,6 @@ def _make_sampling_concurrency_controller(
         if not uses_managed_vllm:
             raise ValueError("sampling_concurrency.policy='engine_load' requires SkyRL-managed vLLM")
         backend_cfg = config.backend_config or {}
-        if not backend_cfg.get("generator.inference_engine.enable_ray_prometheus_stats", True):
-            raise ValueError(
-                "sampling_concurrency.policy='engine_load' requires "
-                "generator.inference_engine.enable_ray_prometheus_stats=true"
-            )
         if backend_cfg.get("generator.inference_engine.enable_pd", False):
             raise ValueError(
                 "sampling_concurrency.policy='engine_load' does not yet support prefill/decode role attribution"
@@ -338,8 +333,9 @@ class TinkerEngine:
         self._forwarding_client = None
         self._forwarding_loop: asyncio.AbstractEventLoop | None = None
         self._vllm_feedback_producer: VLLMEngineFeedbackProducer | None = None
-        self._active_feedback_url: str | None = None
+        self._active_feedback_urls: tuple[str, ...] = ()
         self._managed_vllm_proxy_url: str | None = None
+        self._managed_vllm_server_urls: tuple[str, ...] = ()
         self._managed_vllm_feedback_enabled = (
             uses_managed_vllm
             and self.sampling_concurrency_controller is not None
@@ -385,12 +381,17 @@ class TinkerEngine:
         """Pass-through to backend metrics for backwards compatibility."""
         return self.backend.metrics
 
-    def _write_inference_state_to_db(self, proxy_url: str | None) -> None:
+    def _write_inference_state_to_db(
+        self,
+        proxy_url: str | None,
+        server_urls: list[str] | None = None,
+    ) -> None:
         """Upsert the singleton EngineStateDB row.
 
         Wired into the backend via set_inference_state_publisher so this
-        engine can resolve the managed vLLM URL on the async sample
-        routing path. ``proxy_url=None`` clears the row (post-teardown).
+        engine can resolve the managed vLLM proxy on the async sample routing
+        path. Direct ``server_urls`` stay process-local and feed adaptive
+        admission. ``proxy_url=None`` clears the row (post-teardown).
         """
         with Session(self.db_engine) as session:
             row = session.get(EngineStateDB, 1) or EngineStateDB(singleton_id=1)
@@ -398,40 +399,46 @@ class TinkerEngine:
             row.updated_at = datetime.now(timezone.utc)
             session.add(row)
             session.commit()
-        self._schedule_managed_vllm_feedback(proxy_url)
+        self._schedule_managed_vllm_feedback(proxy_url, server_urls)
 
-    def _schedule_managed_vllm_feedback(self, proxy_url: str | None) -> None:
+    def _schedule_managed_vllm_feedback(
+        self,
+        proxy_url: str | None,
+        server_urls: list[str] | None = None,
+    ) -> None:
         self._managed_vllm_proxy_url = proxy_url
+        self._managed_vllm_server_urls = tuple(server_urls or ())
         if not self._managed_vllm_feedback_enabled or self._forwarding_loop is None:
             return
+        feedback_urls = self._managed_vllm_server_urls
         loop = self._forwarding_loop
         loop.call_soon_threadsafe(
             lambda: asyncio.create_task(
-                self._replace_managed_vllm_feedback_producer(proxy_url),
+                self._replace_managed_vllm_feedback_producer(feedback_urls),
                 name="tinker-vllm-feedback-reconfigure",
             )
         )
 
-    async def _replace_managed_vllm_feedback_producer(self, proxy_url: str | None) -> None:
+    async def _replace_managed_vllm_feedback_producer(self, server_urls: tuple[str, ...]) -> None:
         """Keep the shared vLLM producer aligned with the current endpoint."""
 
-        if proxy_url == self._active_feedback_url and self._vllm_feedback_producer is not None:
+        if server_urls == self._active_feedback_urls and self._vllm_feedback_producer is not None:
             return
         if self._vllm_feedback_producer is not None:
             await self._vllm_feedback_producer.aclose()
             self._vllm_feedback_producer = None
-            self._active_feedback_url = None
-        if proxy_url is None:
+            self._active_feedback_urls = ()
+        if not server_urls:
             return
         from skyrl.train.utils.vllm_metrics_scraper import VLLMEngineFeedbackProducer
 
         assert self.sampling_concurrency_controller is not None
         producer = VLLMEngineFeedbackProducer(
             self.sampling_concurrency_controller,
-            model_server_urls=[proxy_url],
+            model_server_urls=list(server_urls),
         )
         self._vllm_feedback_producer = producer
-        self._active_feedback_url = proxy_url
+        self._active_feedback_urls = server_urls
         producer.start()
 
     @contextmanager
@@ -1167,7 +1174,10 @@ class TinkerEngine:
                 self._forwarding_loop.run_forever()
 
             threading.Thread(target=run_forwarding_loop, name="tinker-sampling-forwarding", daemon=True).start()
-            self._schedule_managed_vllm_feedback(self._managed_vllm_proxy_url)
+            self._schedule_managed_vllm_feedback(
+                self._managed_vllm_proxy_url,
+                list(self._managed_vllm_server_urls),
+            )
             threading.Thread(target=self.process_external_samples, name="tinker-sampling-dispatch", daemon=True).start()
         logger.info("Starting background engine...")
         self.process_pending_requests()
