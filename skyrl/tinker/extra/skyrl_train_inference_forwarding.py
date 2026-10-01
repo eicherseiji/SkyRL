@@ -70,8 +70,8 @@ class SkyRLTrainInferenceForwardingClient:
         checkpoint_id: str,
         *,
         base_model: str | None = None,
-    ):
-        """Forward a sample request to vLLM and write the result to FutureDB."""
+    ) -> bool:
+        """Forward to vLLM, persist the result, and report success."""
         try:
             result = await self._forward_with_retry(sample_req, model_id, base_model=base_model)
             result_data = result.model_dump()
@@ -87,11 +87,12 @@ class SkyRLTrainInferenceForwardingClient:
                 # Row was deleted between scheduling and completion (cancelled
                 # request, stale-session GC). Nothing to write back.
                 logger.warning("FutureDB row %s missing on completion write — skipping", request_id)
-                return
+                return False
             future.result_data = result_data
             future.status = status
             future.completed_at = datetime.now(timezone.utc)
             await session.commit()
+        return status == RequestStatus.COMPLETED
 
     async def _forward_with_retry(self, sample_req, model_id: str, *, base_model: str | None) -> types.SampleOutput:
         # httpx.RequestError covers ConnectError, ReadError, TimeoutException, etc.
