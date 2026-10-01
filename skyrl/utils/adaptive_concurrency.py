@@ -312,7 +312,7 @@ class FixedConcurrencyPolicy:
 
 
 class EngineLoadConcurrencyPolicy:
-    """V1 adaptive policy for coherent per-engine vLLM load snapshots.
+    """Adaptive policy for coherent per-engine vLLM load snapshots.
 
     The policy grows by pipeline turnover while the most recent scrape is
     clear, soft-trims when KV usage loses headroom, and cuts on preemptions or

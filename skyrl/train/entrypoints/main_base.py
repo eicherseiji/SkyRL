@@ -19,6 +19,9 @@ from skyrl.env_vars import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl.train.config import SkyRLTrainConfig, get_config_as_yaml_str
 from skyrl.train.dataset import PromptDataset
 from skyrl.train.generators.base import GeneratorInterface
+from skyrl.train.sampling_concurrency import (
+    build_sampling_client,
+)
 from skyrl.train.trainer import RayPPOTrainer
 from skyrl.train.utils import validate_cfg
 from skyrl.train.utils.tracking import Tracking
@@ -217,7 +220,8 @@ class BasePPOExp:
             The inference engine client.
         """
         logger.info("Initializing inference client")
-        return self._get_new_inference_client()
+        backend = self._get_new_inference_client()
+        return build_sampling_client(backend, self.cfg.generator)
 
     def _get_new_inference_client(self) -> InferenceEngineInterface:
         """New inference client using HTTP endpoints.
@@ -318,7 +322,7 @@ class BasePPOExp:
         try:
             trainer = self._setup_trainer()
             # Start the training loop
-            asyncio.run(trainer.train())
+            asyncio.run(self._run_with_sampling_service(trainer))
         except Exception as e:
             # OOMs raised inside actor init (e.g. FSDPPolicyWorkerBase.init_model)
             # surface here as RayTaskError. Without this they only land in Ray
@@ -333,6 +337,19 @@ class BasePPOExp:
             else:
                 logger.error(f"Setup failed before tracker was initialized:\n{e}")
             raise
+
+    async def _run_with_sampling_service(self, trainer: RayPPOTrainer) -> None:
+        """Bind and close optional sampling-service lifecycle on the trainer loop."""
+
+        start = getattr(trainer.inference_engine_client, "start", None)
+        if start is not None:
+            start()
+        try:
+            await trainer.train()
+        finally:
+            aclose_service = getattr(trainer.inference_engine_client, "aclose_service", None)
+            if aclose_service is not None:
+                await aclose_service()
 
 
 @ray.remote(num_cpus=1)
