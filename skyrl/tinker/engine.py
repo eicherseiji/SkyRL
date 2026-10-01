@@ -1,15 +1,20 @@
 """Background engine for processing training requests."""
 
 import argparse
+import asyncio
+import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from cloudpathlib import AnyPath
 from pydantic import BaseModel
+from sqlalchemy import inspect
+from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Session, create_engine, func, select, update
 
 from skyrl.backends.utils import log_timing
@@ -24,10 +29,27 @@ from skyrl.tinker.db_models import (
     RequestStatus,
     SessionDB,
     enable_sqlite_wal,
+    get_async_database_url,
+)
+from skyrl.tinker.extra import (
+    ExternalInferenceClient,
+    SkyRLTrainInferenceForwardingClient,
+)
+from skyrl.utils.adaptive_concurrency import (
+    FixedConcurrencyPolicy,
+    SamplingConcurrencyController,
 )
 from skyrl.utils.log import logger
 
 _MAX_IDS_PER_QUERY = 500
+
+
+@dataclass(frozen=True)
+class _DispatchedExternalSample:
+    """Transient execution handle for one durable DISPATCHED sample row."""
+
+    request_id: int
+    task: asyncio.Task[None]
 
 
 def _model_not_found_error(model_id: str) -> types.ErrorResponse:
@@ -268,10 +290,35 @@ class TinkerEngine:
         backend_config = backend_config_class(**config.backend_config)
         self.backend = backend_class(config.base_model, backend_config)
 
-        # Backends that support async sample routing notify us when their
-        # inference endpoint changes; we persist it to EngineStateDB so the
-        # API process can forward sample requests directly. Backends stay
-        # DB-free; only the engine owns the connection.
+        settings = config.sampling_concurrency
+        self.sampling_concurrency_controller = (
+            SamplingConcurrencyController(
+                policy=FixedConcurrencyPolicy(),
+                initial_limit=settings.initial_limit,
+            )
+            if settings.enabled
+            else None
+        )
+        self._external_samples: dict[int, _DispatchedExternalSample] = {}
+        self._forwarding_client = None
+        self._forwarding_loop: asyncio.AbstractEventLoop | None = None
+
+        backend_cfg = config.backend_config or {}
+        is_colocated = bool(backend_cfg.get("trainer.placement.colocate_all", True))
+        uses_managed_vllm = (
+            not config.external_inference_url and config.backend in ("megatron", "fsdp") and not is_colocated
+        )
+        if config.external_inference_url or uses_managed_vllm:
+            async_db_engine = create_async_engine(get_async_database_url(config.database_url), echo=False)
+            client_type = (
+                ExternalInferenceClient if config.external_inference_url else SkyRLTrainInferenceForwardingClient
+            )
+            self._forwarding_client = client_type(config, async_db_engine)
+
+        self._recover_dispatched_samples()
+
+        # Backends that support async sample routing notify this long-lived
+        # engine when their inference endpoint changes.
         if hasattr(self.backend, "set_inference_state_publisher"):
             self.backend.set_inference_state_publisher(self._write_inference_state_to_db)
 
@@ -279,6 +326,20 @@ class TinkerEngine:
         self._last_cleanup_time: float = time.time()
 
         logger.info(f"Initialized TinkerEngine with backend={type(self.backend).__name__}")
+
+    def _recover_dispatched_samples(self) -> None:
+        """Return sampling work orphaned by an earlier engine process to its queue."""
+
+        if not inspect(self.db_engine).has_table(FutureDB.__tablename__):
+            return
+        with Session(self.db_engine) as session:
+            session.exec(
+                update(FutureDB)
+                .where(FutureDB.request_type.in_([types.RequestType.SAMPLE, types.RequestType.EXTERNAL]))
+                .where(FutureDB.status == RequestStatus.DISPATCHED)
+                .values(status=RequestStatus.PENDING)
+            )
+            session.commit()
 
     @property
     def metrics(self) -> types.EngineMetrics:
@@ -288,8 +349,8 @@ class TinkerEngine:
     def _write_inference_state_to_db(self, proxy_url: str | None) -> None:
         """Upsert the singleton EngineStateDB row.
 
-        Wired into the backend via set_inference_state_publisher so the API
-        process can resolve the engine-managed vLLM URL on the async sample
+        Wired into the backend via set_inference_state_publisher so this
+        engine can resolve the managed vLLM URL on the async sample
         routing path. ``proxy_url=None`` clears the row (post-teardown).
         """
         with Session(self.db_engine) as session:
@@ -448,6 +509,9 @@ class TinkerEngine:
             if not checkpoint_id or model_checkpoints.setdefault(model_id, checkpoint_id) == checkpoint_id:
                 batchable.append((request_id, model_id))
 
+        if self.sampling_concurrency_controller is not None:
+            batchable = batchable[: self.sampling_concurrency_controller.current_limit]
+
         # TODO: This leaks the abstraction by accessing backend-specific config.
         # We should find a better way to handle this going forward.
         if self.config.backend == "jax" and self.backend.config.sample_max_num_sequences > 0:
@@ -457,6 +521,26 @@ class TinkerEngine:
             str(request_id): (model_id, types.SampleInput.model_validate(request_data))
             for request_id, model_id, request_data in self._load_requests(session, batchable)
         }
+
+    def dispatch_sample_requests(
+        self,
+        session: Session,
+        requests: dict[str, tuple[str, types.SampleInput]],
+    ) -> None:
+        """Atomically record ownership of an internal sample batch."""
+
+        if not requests:
+            return
+        request_ids = [int(request_id) for request_id in requests]
+        result = session.exec(
+            update(FutureDB)
+            .where(FutureDB.request_id.in_(request_ids))
+            .where(FutureDB.status == RequestStatus.PENDING)
+            .values(status=RequestStatus.DISPATCHED)
+        )
+        session.commit()
+        if result.rowcount != len(request_ids):
+            raise RuntimeError(f"Expected to dispatch {len(request_ids)} samples, updated {result.rowcount}")
 
     def find_single_requests(self, session: Session) -> dict[str, tuple[str, types.RequestType, dict]]:
         """Find all requests that need to be processed individually (not batchable).
@@ -797,6 +881,133 @@ class TinkerEngine:
                     results = {request_id: types.ErrorResponse(error=str(e), status="failed") for request_id in group}
             self._complete_futures(results)
 
+    def find_dispatchable_external_samples(self, session: Session) -> dict[str, tuple[str, types.SampleInput]]:
+        """Select durable external rows that fit the current request window."""
+
+        if self._forwarding_client is None:
+            return {}
+        pending = session.exec(
+            select(FutureDB.request_id, FutureDB.model_id, FutureDB.request_data)
+            .where(FutureDB.request_type == types.RequestType.EXTERNAL)
+            .where(FutureDB.status == RequestStatus.PENDING)
+            .order_by(FutureDB.request_id)
+        ).all()
+        controller = self.sampling_concurrency_controller
+        if controller is not None:
+            dispatched = session.exec(
+                select(FutureDB.request_id)
+                .where(FutureDB.request_type == types.RequestType.EXTERNAL)
+                .where(FutureDB.status == RequestStatus.DISPATCHED)
+            ).all()
+            available = max(0, controller.current_limit - len(dispatched))
+            pending = pending[:available]
+        return {
+            str(request_id): (model_id or "", types.SampleInput.model_validate(request_data))
+            for request_id, model_id, request_data in pending
+        }
+
+    def dispatch_external_samples(
+        self,
+        session: Session,
+        requests: dict[str, tuple[str, types.SampleInput]],
+    ) -> dict[str, tuple[str, types.SampleInput]]:
+        """Move selected rows from PENDING to DISPATCHED before execution."""
+
+        if not requests:
+            return {}
+        request_ids = [int(request_id) for request_id in requests]
+        result = session.exec(
+            update(FutureDB)
+            .where(FutureDB.request_id.in_(request_ids))
+            .where(FutureDB.status == RequestStatus.PENDING)
+            .values(status=RequestStatus.DISPATCHED)
+        )
+        session.commit()
+        if result.rowcount != len(request_ids):
+            raise RuntimeError(f"Expected to dispatch {len(request_ids)} external samples, updated {result.rowcount}")
+        return requests
+
+    def _requeue_external_samples(self, request_ids: list[int]) -> int:
+        """Return still-owned external samples to PENDING after execution aborts."""
+
+        if not request_ids:
+            return 0
+        with Session(self.db_engine) as session:
+            result = session.exec(
+                update(FutureDB)
+                .where(FutureDB.request_id.in_(request_ids))
+                .where(FutureDB.request_type == types.RequestType.EXTERNAL)
+                .where(FutureDB.status == RequestStatus.DISPATCHED)
+                .values(
+                    status=RequestStatus.PENDING,
+                    result_data=None,
+                    completed_at=None,
+                )
+            )
+            session.commit()
+            return result.rowcount
+
+    def _submit_external_sample(self, request_id: str, model_id: str, request_data: types.SampleInput) -> None:
+        assert self._forwarding_client is not None
+        assert self._forwarding_loop is not None
+        numeric_request_id = int(request_id)
+
+        async def execute() -> None:
+            try:
+                controller = self.sampling_concurrency_controller
+                if controller is None:
+                    await self._forwarding_client.call_and_store_result(
+                        numeric_request_id,
+                        request_data,
+                        model_id,
+                        request_data.checkpoint_id,
+                        base_model=request_data.base_model,
+                    )
+                    return
+                async with controller.slot():
+                    await self._forwarding_client.call_and_store_result(
+                        numeric_request_id,
+                        request_data,
+                        model_id,
+                        request_data.checkpoint_id,
+                        base_model=request_data.base_model,
+                    )
+            except Exception:
+                # The forwarding clients persist ordinary inference failures as
+                # FAILED. Requeue only unexpected task crashes (for example a DB
+                # write failure), preserving durable at-least-once execution.
+                self._requeue_external_samples([numeric_request_id])
+                raise
+
+        def start() -> None:
+            task = asyncio.create_task(execute(), name=f"tinker-external-sample-{request_id}")
+            dispatched = _DispatchedExternalSample(request_id=numeric_request_id, task=task)
+            self._external_samples[numeric_request_id] = dispatched
+
+            def finish(completed: asyncio.Task[None]) -> None:
+                if self._external_samples.get(numeric_request_id) is dispatched:
+                    self._external_samples.pop(numeric_request_id, None)
+                if not completed.cancelled() and completed.exception() is not None:
+                    logger.error("External sample task %s crashed: %s", request_id, completed.exception())
+
+            task.add_done_callback(finish)
+
+        self._forwarding_loop.call_soon_threadsafe(start)
+
+    def process_external_samples(self) -> None:
+        """Continuously dispatch durable external sample requests."""
+
+        while True:
+            try:
+                with Session(self.db_engine) as session:
+                    requests = self.find_dispatchable_external_samples(session)
+                    requests = self.dispatch_external_samples(session, requests)
+                for request_id, (model_id, request_data) in requests.items():
+                    self._submit_external_sample(request_id, model_id, request_data)
+            except Exception:
+                logger.exception("External sample dispatcher iteration failed")
+            time.sleep(0.05)
+
     def process_pending_requests(self):
         """Main loop to process pending requests."""
         while True:
@@ -809,6 +1020,7 @@ class TinkerEngine:
                 forward_requests = self.find_batchable_model_passes(session, types.RequestType.FORWARD)
                 # Find pending sample requests that can be batched
                 sample_requests = self.find_batchable_sample(session)
+                self.dispatch_sample_requests(session, sample_requests)
                 # Get other pending requests (non forward_backward and non sampling)
                 other_requests = self.find_single_requests(session)
 
@@ -833,6 +1045,16 @@ class TinkerEngine:
 
     def run(self):
         """Entry point to start the engine."""
+        if self._forwarding_client is not None:
+            self._forwarding_loop = asyncio.new_event_loop()
+
+            def run_forwarding_loop() -> None:
+                assert self._forwarding_loop is not None
+                asyncio.set_event_loop(self._forwarding_loop)
+                self._forwarding_loop.run_forever()
+
+            threading.Thread(target=run_forwarding_loop, name="tinker-sampling-forwarding", daemon=True).start()
+            threading.Thread(target=self.process_external_samples, name="tinker-sampling-dispatch", daemon=True).start()
         logger.info("Starting background engine...")
         self.process_pending_requests()
 
