@@ -21,7 +21,7 @@ from loguru import logger
 
 from skyrl.utils.adaptive_concurrency import (
     ConcurrencyDecision,
-    SamplingConcurrencyController,
+    SamplingFeedbackSink,
     VLLMEngineLoad,
     VLLMEngineSamplingFeedback,
 )
@@ -530,7 +530,7 @@ class VLLMEngineFeedbackProducer:
 
     def __init__(
         self,
-        controller: SamplingConcurrencyController,
+        controller: SamplingFeedbackSink,
         *,
         poll_interval_s: float = 5.0,
         scraper: Optional[VLLMMetricsScraper] = None,

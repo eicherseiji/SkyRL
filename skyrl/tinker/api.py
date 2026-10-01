@@ -44,6 +44,7 @@ from skyrl.tinker.extra import (
     ExternalInferenceClient,
     SkyRLTrainInferenceForwardingClient,
 )
+from skyrl.tinker.sampling_feedback import LatestSamplingFeedbackStore
 from skyrl.utils.log import get_uvicorn_log_config, logger
 from skyrl.utils.storage import download_file
 
@@ -207,6 +208,25 @@ async def lifespan(app: FastAPI):
 
     app.state.future_waiters = {}
     app.state.future_poller = asyncio.create_task(poll_futures(app.state.db_engine, app.state.future_waiters))
+    app.state.sampling_feedback_store = LatestSamplingFeedbackStore()
+    app.state.sampling_feedback_producer = None
+
+    if app.state.engine_config.sampling_feedback_metrics_urls:
+        from skyrl.train.utils.vllm_metrics_scraper import (
+            VLLMEngineFeedbackProducer,
+            VLLMMetricsScraper,
+        )
+
+        app.state.sampling_feedback_producer = VLLMEngineFeedbackProducer(
+            app.state.sampling_feedback_store,
+            poll_interval_s=app.state.engine_config.sampling_feedback_poll_interval_s,
+            scraper=VLLMMetricsScraper(urls=app.state.engine_config.sampling_feedback_metrics_urls),
+        )
+        app.state.sampling_feedback_producer.start()
+        logger.info(
+            "Tinker sampling feedback response metadata enabled from %d metrics endpoint(s)",
+            len(app.state.engine_config.sampling_feedback_metrics_urls),
+        )
 
     # Setup external inference client if configured.
     #
@@ -284,6 +304,11 @@ async def lifespan(app: FastAPI):
     app.state.future_poller.cancel()
     with suppress(asyncio.CancelledError):
         await app.state.future_poller
+
+    feedback_producer = getattr(app.state, "sampling_feedback_producer", None)
+    if feedback_producer is not None:
+        with suppress(Exception):
+            await feedback_producer.aclose()
 
     # Close the forwarding client's persistent httpx connection pool if we
     # installed one. Cheap no-op when external_inference_client doesn't own
@@ -752,6 +777,12 @@ class FutureResponse(BaseModel):
     request_id: str
 
 
+class SampleFutureResponse(FutureResponse):
+    """Accepted sampling request plus optional backend-pressure metadata."""
+
+    sampling_feedback: dict[str, Any] | None = None
+
+
 class TelemetryEvent(BaseModel):
     event: str
     event_id: str
@@ -1212,7 +1243,7 @@ async def get_sampling_model(request: SampleRequest, session: AsyncSession) -> (
     return (request.base_model, request.model_path)
 
 
-@app.post("/api/v1/asample", response_model=FutureResponse)
+@app.post("/api/v1/asample", response_model=SampleFutureResponse, response_model_exclude_none=True)
 async def asample(request: SampleRequest, req: Request, session: AsyncSession = Depends(get_session)):
     """Generates samples from the model (async version)."""
     if request.sampling_session_id is not None and ":" in request.sampling_session_id:
@@ -1273,7 +1304,15 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
             )
         )
 
-    return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
+    feedback_metadata = None
+    if req.headers.get("X-Tinker-Sampling-Backpressure") == "1":
+        feedback_metadata = req.app.state.sampling_feedback_store.snapshot()
+    return SampleFutureResponse(
+        future_id=str(request_id),
+        status="pending",
+        request_id=str(request_id),
+        sampling_feedback=feedback_metadata,
+    )
 
 
 @app.get("/api/v1/get_server_capabilities", response_model=GetServerCapabilitiesResponse)

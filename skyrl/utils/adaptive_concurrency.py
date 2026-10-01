@@ -12,6 +12,7 @@ JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 
 ENGINE_LOADS_METRIC = "engine.loads"
+SAMPLING_FEEDBACK_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,70 @@ class VLLMEngineSamplingFeedback(SamplingFeedback):
         super().__post_init__()
 
 
+def sampling_feedback_to_metadata(feedback: SamplingFeedback) -> dict[str, JsonValue]:
+    """Serialize feedback for a backend response without coupling its client to Python classes."""
+
+    metrics = dict(feedback.metrics)
+    if isinstance(feedback, VLLMEngineSamplingFeedback):
+        metrics.pop(ENGINE_LOADS_METRIC, None)
+        return {
+            "schema_version": SAMPLING_FEEDBACK_SCHEMA_VERSION,
+            "kind": "vllm_engine",
+            "metrics": metrics,
+            "engine_loads": [
+                {
+                    "engine_id": load.engine_id,
+                    "role": load.role,
+                    "kv_capacity_tokens": load.kv_capacity_tokens,
+                    "max_model_len": load.max_model_len,
+                    "kv_usage": load.kv_usage,
+                    "running": load.running,
+                    "waiting": load.waiting,
+                    "waiting_capacity": load.waiting_capacity,
+                    "preemptions_delta": load.preemptions_delta,
+                }
+                for load in feedback.engine_loads
+            ],
+        }
+    return {
+        "schema_version": SAMPLING_FEEDBACK_SCHEMA_VERSION,
+        "kind": "generic",
+        "metrics": metrics,
+    }
+
+
+def sampling_feedback_from_metadata(metadata: Mapping[str, object]) -> SamplingFeedback:
+    """Decode the versioned feedback object carried by a backend response."""
+
+    version = metadata.get("schema_version")
+    if version != SAMPLING_FEEDBACK_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported sampling feedback schema_version={version!r}; expected {SAMPLING_FEEDBACK_SCHEMA_VERSION}"
+        )
+    kind = metadata.get("kind")
+    raw_metrics = metadata.get("metrics", {})
+    if not isinstance(raw_metrics, Mapping):
+        raise TypeError("sampling feedback metrics must be a mapping")
+    metrics = dict(raw_metrics)
+    if kind == "generic":
+        return SamplingFeedback(metrics=metrics)  # type: ignore[arg-type]
+    if kind != "vllm_engine":
+        raise ValueError(f"Unsupported sampling feedback kind={kind!r}")
+
+    raw_loads = metadata.get("engine_loads")
+    if not isinstance(raw_loads, list) or not raw_loads:
+        raise ValueError("vllm_engine sampling feedback requires non-empty engine_loads")
+    loads = []
+    for index, raw_load in enumerate(raw_loads):
+        if not isinstance(raw_load, Mapping):
+            raise TypeError(f"engine_loads[{index}] must be a mapping")
+        loads.append(VLLMEngineLoad(**dict(raw_load)))  # type: ignore[arg-type]
+    return VLLMEngineSamplingFeedback(
+        metrics=metrics,  # type: ignore[arg-type]
+        engine_loads=tuple(loads),
+    )
+
+
 @dataclass(frozen=True)
 class SamplingCompletion:
     """Lifecycle event emitted after one admitted inference request completes."""
@@ -163,6 +228,13 @@ class ConcurrencyPolicy(Protocol):
     def on_completion(
         self, completion: SamplingCompletion, context: ConcurrencyContext
     ) -> ConcurrencyDecision | None: ...
+
+
+@runtime_checkable
+class SamplingFeedbackSink(Protocol):
+    """Structural sink used by feedback producers and response-metadata stores."""
+
+    async def on_feedback(self, feedback: SamplingFeedback) -> ConcurrencyDecision | None: ...
 
 
 class ResizableConcurrencyLimiter:

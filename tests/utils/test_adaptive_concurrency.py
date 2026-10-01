@@ -14,6 +14,8 @@ from skyrl.utils.adaptive_concurrency import (
     SamplingFeedback,
     VLLMEngineLoad,
     VLLMEngineSamplingFeedback,
+    sampling_feedback_from_metadata,
+    sampling_feedback_to_metadata,
 )
 
 
@@ -166,6 +168,34 @@ def test_feedback_accepts_a_coherent_engine_load_snapshot():
 
     assert feedback.engine_loads == loads
     assert feedback.metrics["engine.loads"][0]["engine_id"] == "decode-0"
+
+
+def test_feedback_response_metadata_round_trip_preserves_typed_vllm_loads():
+    feedback = VLLMEngineSamplingFeedback(
+        metrics={"backend.region": "test"},
+        engine_loads=(
+            VLLMEngineLoad(
+                engine_id="decode-0",
+                role="decode",
+                kv_capacity_tokens=131_072,
+                max_model_len=32_768,
+                kv_usage=0.72,
+                running=12,
+                waiting=2,
+                waiting_capacity=1,
+                preemptions_delta=0,
+            ),
+        ),
+    )
+
+    restored = sampling_feedback_from_metadata(sampling_feedback_to_metadata(feedback))
+
+    assert restored == feedback
+
+
+def test_feedback_response_metadata_rejects_unknown_schema_version():
+    with pytest.raises(ValueError, match="schema_version"):
+        sampling_feedback_from_metadata({"schema_version": 2, "kind": "generic"})
 
 
 def engine_feedback(

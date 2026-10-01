@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import get_origin
 
 from cloudpathlib import AnyPath
 from pydantic import BaseModel, ConfigDict, Field
@@ -57,6 +58,19 @@ class EngineConfig(BaseModel):
             "file descriptors). Set an int to enforce a per-API-process cap."
         ),
         json_schema_extra={"argparse_type": lambda v: None if v == "None" else int(v)},
+    )
+    sampling_feedback_metrics_urls: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Prometheus metrics endpoints used by the Tinker response-metadata POC. "
+            "When set, the API publishes the latest managed-vLLM engine snapshot in /asample responses."
+        ),
+        json_schema_extra={"argparse_type": json.loads},
+    )
+    sampling_feedback_poll_interval_s: float = Field(
+        default=5.0,
+        gt=0,
+        description="Polling interval for Tinker sampling feedback response metadata.",
     )
     session_cleanup_interval_sec: int = Field(
         default=60,
@@ -135,8 +149,8 @@ def config_to_argv(cfg: BaseModel) -> list[str]:
 
         if field.annotation is bool:
             argv.append(f"--{arg_name}" if value else f"--no-{arg_name}")
-        elif field.annotation is dict:
-            # Serialize dict to JSON string
+        elif field.annotation is dict or get_origin(field.annotation) in (dict, list):
+            # Serialize container values to JSON strings.
             if value:
                 argv.append(f"--{arg_name}")
                 argv.append(json.dumps(value))
