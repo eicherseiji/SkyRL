@@ -50,6 +50,11 @@ class _SimDispatch:
         # Mirror the real dispatch: advance the policy version after the (simulated) sync.
         self._client.increment_weight_version()
 
+    def finalize_pending_saves(self, role: str) -> None:
+        """Match the real dispatch cleanup contract; simulation never saves."""
+
+        _ = role
+
 
 class FullyAsyncTrainerSim(FullyAsyncRayPPOTrainer):
     """Fully-async trainer with a SIMULATED training step (no trainer components).
