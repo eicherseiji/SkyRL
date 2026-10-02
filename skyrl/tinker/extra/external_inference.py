@@ -52,8 +52,8 @@ class ExternalInferenceClient:
         checkpoint_id: str,
         *,
         base_model: str | None = None,
-    ):
-        """Background task to call external engine and store result in database."""
+    ) -> bool:
+        """Call the external engine, persist its result, and report success."""
         try:
             async with httpx.AsyncClient(
                 base_url=self.base_url,
@@ -74,11 +74,12 @@ class ExternalInferenceClient:
             future = await session.get(FutureDB, request_id)
             if future is None:
                 logger.warning("FutureDB row %s missing on completion write — skipping", request_id)
-                return
+                return False
             future.result_data = result_data
             future.status = status
             future.completed_at = datetime.now(timezone.utc)
             await session.commit()
+        return status == RequestStatus.COMPLETED
 
     async def _forward_to_engine(
         self,

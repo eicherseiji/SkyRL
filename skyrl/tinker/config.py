@@ -4,18 +4,31 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Literal
 
 from cloudpathlib import AnyPath
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class SamplingConcurrencyConfig(BaseModel):
-    """Fixed admission window for Tinker's durable sampling-request queue."""
+    """Admission settings for Tinker's durable sampling-request queue."""
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+    policy: Literal["fixed", "engine_load"] = "fixed"
     initial_limit: int = Field(default=8, ge=1)
+    min_limit: int = Field(default=1, ge=1)
+    max_limit: int = Field(default=256, ge=1)
+
+    @model_validator(mode="after")
+    def validate_limits(self) -> "SamplingConcurrencyConfig":
+        if not self.min_limit <= self.initial_limit <= self.max_limit:
+            raise ValueError(
+                "sampling_concurrency.initial_limit must be between "
+                f"min_limit ({self.min_limit}) and max_limit ({self.max_limit}), got {self.initial_limit}"
+            )
+        return self
 
 
 class EngineConfig(BaseModel):
@@ -69,7 +82,7 @@ class EngineConfig(BaseModel):
     )
     sampling_concurrency: SamplingConcurrencyConfig = Field(
         default_factory=SamplingConcurrencyConfig,
-        description="Fixed admission for the durable sample-request queue.",
+        description="Admission for the durable sample-request queue.",
         json_schema_extra={"argparse_type": json.loads},
     )
     session_cleanup_interval_sec: int = Field(
