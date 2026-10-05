@@ -40,7 +40,7 @@ class SkyRLTrainInferenceForwardingClient:
         )
 
     async def aclose(self) -> None:
-        """Close the persistent httpx client. Called from api.py lifespan shutdown."""
+        """Close the persistent httpx client."""
         await self._http_client.aclose()
 
     async def _read_proxy_url_from_db(self) -> str | None:
@@ -116,7 +116,7 @@ class SkyRLTrainInferenceForwardingClient:
         # save_weights_for_sampler; base_model is used for non-LoRA sampling.
         model_name = base_model if base_model else model_id
 
-        model_input = sample_req.prompt.to_types()
+        model_input = sample_req.prompt.to_types() if hasattr(sample_req.prompt, "to_types") else sample_req.prompt
         prompt_tokens = render_model_input([model_input])[0].prompt_ids
 
         sp = sample_req.sampling_params
