@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections import Counter
 
 import pytest
@@ -114,7 +115,7 @@ class _SimulatedForwardingClient:
                 assert row is not None
                 assert row.status == RequestStatus.DISPATCHED
                 row.status = RequestStatus.COMPLETED
-                row.result_data = {"request_id": request_id}
+                row.result_data = json.dumps({"request_id": request_id})
                 session.add(row)
                 session.commit()
             return True
@@ -225,4 +226,6 @@ async def test_forwarding_crash_stress_requeues_without_losing_or_duplicating_re
     assert all(client.calls[request_id] == (2 if request_id in crash_once else 1) for request_id in request_ids)
     with Session(engine.db_engine) as session:
         rows = session.exec(select(FutureDB).order_by(FutureDB.request_id)).all()
-        assert [row.result_data for row in rows] == [{"request_id": request_id} for request_id in request_ids]
+        assert [json.loads(row.result_data) for row in rows] == [
+            {"request_id": request_id} for request_id in request_ids
+        ]
