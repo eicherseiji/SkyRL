@@ -409,6 +409,15 @@ class SamplingClient(InferenceEngineInterface):
     async def update_named_weights(self, request):
         return await self._backend.update_named_weights(request)
 
+    async def load_lora_adapter(
+        self,
+        lora_name: str,
+        lora_path: str | None = None,
+        *,
+        in_memory: bool = False,
+    ) -> dict[str, Any]:
+        return await self._backend.load_lora_adapter(lora_name, lora_path, in_memory=in_memory)
+
     async def reset_prefix_cache(self, reset_running_requests: bool = False):
         return await self._backend.reset_prefix_cache(reset_running_requests)
 
