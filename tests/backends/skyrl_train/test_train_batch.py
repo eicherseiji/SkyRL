@@ -1,4 +1,6 @@
 import pickle
+from collections.abc import Callable
+from typing import Any, get_args
 
 import numpy as np
 import pytest
@@ -6,12 +8,46 @@ import ray
 import torch
 
 from skyrl.backends.skyrl_train.training_batch import (
+    PACKED_FIELD_PADDING,
+    BatchField,
     TensorBatch,
+    TensorFormat,
     TensorList,
     TrainingInput,
     TrainingInputBatch,
+    _deserialize_tensor,
+    _serialize_tensor,
+    append_packed_field_padding,
+    make_packed_field_padding,
+    packed_dummy_row_segments,
     pad_training_input_batch,
 )
+from skyrl.backends.skyrl_train.utils.packed_ragged_tensor import PackedRaggedTensor
+from skyrl.backends.skyrl_train.utils.packed_tensor import (
+    PackedTensor,
+    cu_seqlens_from_lengths,
+)
+from skyrl.backends.skyrl_train.utils.routed_experts import ROUTED_EXPERT_DTYPES
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_FIELD,
+    SAMPLE_SUPPORT_TORCH_DTYPE,
+)
+from tests.backends.skyrl_train.sample_support_helpers import ragged_support
+
+OUT_OF_BAND_PICKLE_PROTOCOL = 5
+
+
+@pytest.fixture
+def oob_round_trip():
+    """Round trip protocol-5 buffers, optionally as read-only views."""
+
+    def round_trip(obj: Any, read_only: bool = False) -> tuple[Any, bytes, list[memoryview]]:
+        buffers: list[pickle.PickleBuffer] = []
+        payload = pickle.dumps(obj, protocol=OUT_OF_BAND_PICKLE_PROTOCOL, buffer_callback=buffers.append)
+        views = [memoryview(bytes(buffer.raw())) if read_only else buffer.raw() for buffer in buffers]
+        return pickle.loads(payload, buffers=views), payload, views
+
+    return round_trip
 
 
 def test_train_batch_initialization():
@@ -107,6 +143,16 @@ def test_train_batch_to_dtype():
     data.to(dtype=torch.float16)
     assert data["sequences"].dtype == torch.float16
     assert data["attention_mask"] is None
+
+
+def test_train_batch_to_dtype_leaves_ragged_member_columns_alone():
+    support = ragged_support([np.array([[1, 2], [3, -1]])])
+    data = TensorBatch({"advantages": torch.randn(1, 2), SAMPLE_SUPPORT_FIELD: support})
+
+    data.to(dtype=torch.float16)
+
+    assert data["advantages"].dtype == torch.float16
+    assert data[SAMPLE_SUPPORT_FIELD] == support
 
 
 def test_train_batch_select():
@@ -552,6 +598,7 @@ EXPECTED_TRAINING_INPUT_FIELDS = {
     "rollout_logprobs",
     "rollout_expert_indices",
     "router_padding_mask",
+    SAMPLE_SUPPORT_FIELD,
     "pixel_values",
     "image_grid_thw",
 }
@@ -576,8 +623,14 @@ def _make_full_training_batch(batch_size: int = 4, seq_len: int = 5) -> Training
         "kl": torch.randn(batch_size, seq_len),
         "rewards": torch.randn(batch_size, seq_len),
         "rollout_logprobs": torch.randn(batch_size, seq_len),
-        "rollout_expert_indices": torch.randint(0, 8, (batch_size, seq_len, 2, 3), dtype=torch.long),
+        # The fixture is fully attended, so each route segment has seq_len rows.
+        "rollout_expert_indices": PackedTensor(
+            torch.randint(0, 8, (batch_size * seq_len, 2, 3), dtype=torch.long),
+            cu_seqlens_from_lengths([seq_len] * batch_size),
+        ),
         "router_padding_mask": torch.zeros((batch_size, seq_len), dtype=torch.bool),
+        # Support packs to response tokens; this fixture's response spans the whole row.
+        SAMPLE_SUPPORT_FIELD: ragged_support(torch.randint(0, 1000, (batch_size, seq_len, 4))),
         "pixel_values": TensorList([torch.randn(i + 1, 3) for i in range(batch_size)]),  # batch_size * (i + 1) * 3
         "image_grid_thw": TensorList([torch.tensor([[1, 2, 3]]) for _ in range(batch_size)]),  # batch_size * 1 * 3
     }
@@ -640,14 +693,24 @@ def test_pad_batch_all_fields():
     # padding rows are copies of row 0.
     assert torch.equal(padded["router_padding_mask"][:batch_size], batch["router_padding_mask"])
     assert torch.all(padded["router_padding_mask"][batch_size:])
-    assert torch.equal(padded["rollout_expert_indices"][:batch_size], batch["rollout_expert_indices"])
-    expected_routes = torch.tensor([0, 1, 2]).expand_as(padded["rollout_expert_indices"][batch_size:])
-    assert torch.equal(padded["rollout_expert_indices"][batch_size:], expected_routes)
+    assert padded["rollout_expert_indices"][:batch_size] == batch["rollout_expert_indices"]
+    padded_routes = padded["rollout_expert_indices"][batch_size:]
+    assert padded_routes.sequence_lengths.tolist() == [seq_len] * pad_size
+    expected_routes = torch.tensor([0, 1, 2]).expand_as(padded_routes.values)
+    assert torch.equal(padded_routes.values, expected_routes)
+
+    padded_support = padded[SAMPLE_SUPPORT_FIELD][batch_size:]
+    assert padded[SAMPLE_SUPPORT_FIELD][:batch_size] == batch[SAMPLE_SUPPORT_FIELD]
+    # Support is indexed over response tokens, and a padded row copies row 0's response.
+    assert padded_support.sequence_lengths.tolist() == [seq_len] * pad_size
+    assert padded_support.num_rows == seq_len * pad_size
+    assert padded_support.num_members == 0
 
     regular_tensor_keys = EXPECTED_TRAINING_INPUT_FIELDS - {
         "loss_mask",
         "rollout_expert_indices",
         "router_padding_mask",
+        SAMPLE_SUPPORT_FIELD,
         "pixel_values",
         "image_grid_thw",
     }
@@ -711,3 +774,313 @@ def test_pad_batch_preserves_none_fields():
     padded = pad_training_input_batch(batch, pad_size=1)
     assert padded["values"] is None
     assert padded.batch_size == 4
+
+
+def test_packed_tensor_field_survives_the_ray_pickle_round_trip():
+    """Packed route buffers cross to the workers via TensorBatch's custom pickle path."""
+    segment_lengths = [3, 1, 4]
+    routes = PackedTensor(
+        torch.randint(0, 128, (sum(segment_lengths), 2, 3), dtype=torch.int16),
+        cu_seqlens_from_lengths(segment_lengths),
+    )
+    data = TensorBatch(
+        {
+            "sequences": torch.randn(len(segment_lengths), 4),
+            "rollout_expert_indices": routes,
+        }
+    )
+    data.metadata = {"response_length": 4}
+
+    unpickled = pickle.loads(pickle.dumps(data))
+
+    restored = unpickled["rollout_expert_indices"]
+    assert isinstance(restored, PackedTensor)
+    assert restored.values.dtype == torch.int16
+    assert restored.cu_seqlens.dtype == routes.cu_seqlens.dtype
+    assert restored == routes
+    assert unpickled == data
+
+
+def test_serialized_field_formats_are_stable():
+    data = TensorBatch(
+        {
+            "sequences": torch.randn(2, 4),
+            "pixel_values": TensorList([torch.randn(1, 3), torch.randn(2, 3)]),
+            "rollout_expert_indices": PackedTensor(
+                torch.zeros((3, 2, 3), dtype=torch.int16), cu_seqlens_from_lengths([2, 1])
+            ),
+            "bf16_logprobs": torch.randn(2, 4, dtype=torch.bfloat16),
+            SAMPLE_SUPPORT_FIELD: PackedRaggedTensor(
+                [torch.tensor([5, 7, 9], dtype=SAMPLE_SUPPORT_TORCH_DTYPE)],
+                cu_seqlens_from_lengths([2, 0, 1]),
+                cu_seqlens_from_lengths([2, 1]),
+            ),
+        }
+    )
+
+    state = data.__getstate__()["batch_dict"]
+
+    assert state["sequences"]["format"] == TensorFormat.NUMPY
+    assert state["bf16_logprobs"]["format"] == TensorFormat.TORCH
+    assert state["pixel_values"]["format"] == TensorFormat.TENSOR_LIST
+    assert state["rollout_expert_indices"]["format"] == TensorFormat.PACKED_TENSOR
+    assert state[SAMPLE_SUPPORT_FIELD]["format"] == TensorFormat.PACKED_RAGGED_TENSOR
+
+
+ROUTE_KEY = "rollout_expert_indices"
+_ZERO_COPY_SEGMENT_LENGTHS = [512, 256, 256]
+_ZERO_COPY_BATCH_SIZE = len(_ZERO_COPY_SEGMENT_LENGTHS)
+
+# One test payload per opted-in field.
+_ZERO_COPY_PAYLOADS: dict[str, Callable[[], BatchField]] = {
+    ROUTE_KEY: lambda: PackedTensor(
+        torch.randint(0, 64, (sum(_ZERO_COPY_SEGMENT_LENGTHS), 2, 3), dtype=torch.int16),
+        cu_seqlens_from_lengths(_ZERO_COPY_SEGMENT_LENGTHS),
+    ),
+    SAMPLE_SUPPORT_FIELD: lambda: ragged_support(
+        [torch.randint(0, 32_000, (length, 20)) for length in _ZERO_COPY_SEGMENT_LENGTHS],
+        logprobs=[-torch.rand(length, 20) for length in _ZERO_COPY_SEGMENT_LENGTHS],
+    ),
+}
+
+
+def _zero_copy_buffers(value: BatchField) -> list[torch.Tensor]:
+    """Return the out-of-band buffers of a zero-copy field."""
+    if isinstance(value, PackedRaggedTensor):
+        return [*value.columns, value.row_offsets]
+    return [value.values if isinstance(value, PackedTensor) else value]
+
+
+def test_zero_copy_keys_are_declared_and_have_payloads():
+    assert TensorBatch.ZERO_COPY_KEYS <= set(TrainingInput.__annotations__)
+    assert set(_ZERO_COPY_PAYLOADS) == TensorBatch.ZERO_COPY_KEYS
+
+
+@pytest.mark.parametrize("key", sorted(TensorBatch.ZERO_COPY_KEYS))
+def test_zero_copy_field_travels_out_of_band(key, oob_round_trip):
+    """Only opted-in fields travel out of band."""
+    field = _ZERO_COPY_PAYLOADS[key]()
+    sequences = torch.randint(0, 100, (_ZERO_COPY_BATCH_SIZE, 4))
+    batch = TrainingInputBatch({"sequences": sequences, key: field})
+    batch.metadata = {"info": "zero-copy"}
+    buffers = _zero_copy_buffers(field)
+
+    unpickled, payload, views = oob_round_trip(batch)
+
+    assert [view.nbytes for view in views] == [
+        buffer.nbytes for buffer in buffers
+    ], f"{key} is the only out-of-band field"
+    assert len(payload) < buffers[0].nbytes, f"{key} must not ALSO sit in the pickle stream"
+    for restored, buffer in zip(_zero_copy_buffers(unpickled[key]), buffers):
+        assert np.shares_memory(restored.numpy(), buffer.numpy())
+    assert not np.shares_memory(unpickled["sequences"].numpy(), sequences.numpy())
+    assert unpickled == batch
+
+
+@pytest.mark.parametrize("key", sorted(TensorBatch.ZERO_COPY_KEYS))
+def test_zero_copy_field_tolerates_read_only_plasma_buffer(key, oob_round_trip):
+    """Zero-copy fields preserve read-only buffers while ordinary fields stay writable."""
+    field = _ZERO_COPY_PAYLOADS[key]()
+    advantages = torch.randn(_ZERO_COPY_BATCH_SIZE, 256)
+    batch = TrainingInputBatch({"advantages": advantages, key: field})
+    batch.metadata = {}
+
+    unpickled, _, views = oob_round_trip(batch, read_only=True)
+
+    assert [view.readonly for view in views] == [True] * len(
+        _zero_copy_buffers(field)
+    ), f"{key} is the only out-of-band field"
+    for restored, view in zip(_zero_copy_buffers(unpickled[key]), views):
+        restored = restored.numpy()
+        assert np.shares_memory(restored, np.frombuffer(view, dtype=restored.dtype)), "read-only buffer was copied"
+    assert unpickled[key] == field
+
+    got = unpickled["advantages"]
+    assert got.numpy().flags.writeable
+    got.add_(1.0)
+    assert torch.allclose(got, advantages + 1.0)
+    assert torch.allclose(batch["advantages"], advantages), "source must not be aliased"
+
+
+def test_packed_zero_copy_field_ships_only_its_values_buffer():
+    """Only a packed field's values use an out-of-band buffer."""
+    batch = TrainingInputBatch({ROUTE_KEY: _ZERO_COPY_PAYLOADS[ROUTE_KEY]()})
+
+    state = batch.__getstate__()["batch_dict"][ROUTE_KEY]
+
+    assert state["format"] == TensorFormat.PACKED_TENSOR
+    assert state["values"]["format"] == TensorFormat.NUMPY_VIEW
+    assert state["cu_seqlens"]["format"] == TensorFormat.NUMPY
+
+
+@pytest.mark.parametrize("dtype", sorted(ROUTED_EXPERT_DTYPES, key=str))
+def test_zero_copy_envelope_round_trips_every_route_dtype(dtype):
+    values = torch.from_numpy(np.arange(48, dtype=dtype).reshape(8, 2, 3))
+
+    envelope = _serialize_tensor(values, zero_copy=True)
+    restored = _deserialize_tensor(envelope)
+
+    assert envelope["format"] == TensorFormat.NUMPY_VIEW
+    assert restored.dtype == values.dtype
+    assert torch.equal(restored, values)
+
+
+def test_zero_copy_falls_back_for_bfloat16():
+    """The numpy TypeError guard must still run before the zero-copy branch."""
+    values = torch.randn(3, 4, dtype=torch.bfloat16)
+
+    assert _serialize_tensor(values, zero_copy=True)["format"] == TensorFormat.TORCH
+
+
+# ── packed field padding ─────────────────────────────────────────────────────
+
+# Expected padding row of each fixed-width packed field; ragged support pads with empty rows.
+_PACKED_PADDING_EXPECTED_ROW: dict[str, Callable[[PackedTensor], torch.Tensor]] = {
+    ROUTE_KEY: lambda field: torch.arange(field.row_shape[-1], dtype=field.dtype),
+}
+
+
+def test_every_packed_training_input_field_has_a_padding_rule():
+    """A packed field with no rule cannot be padded, and would raise mid-training-step."""
+    packed_fields = {
+        name
+        for name, annotation in TrainingInput.__annotations__.items()
+        if {PackedTensor, PackedRaggedTensor} & set(get_args(annotation))
+    }
+    assert packed_fields == set(PACKED_FIELD_PADDING)
+
+
+@pytest.mark.parametrize("key", sorted(_PACKED_PADDING_EXPECTED_ROW))
+def test_packed_field_padding_carries_that_fields_own_fill(key):
+    field = _ZERO_COPY_PAYLOADS[key]()
+    segment_lengths = [1, 3]
+
+    padding = make_packed_field_padding(key, field, segment_lengths=segment_lengths)
+
+    assert padding.sequence_lengths.tolist() == segment_lengths
+    assert padding.row_shape == field.row_shape
+    assert padding.dtype == field.dtype
+    assert torch.equal(padding.values, _PACKED_PADDING_EXPECTED_ROW[key](field).expand_as(padding.values))
+
+
+@pytest.mark.parametrize("key", sorted(_PACKED_PADDING_EXPECTED_ROW))
+@pytest.mark.parametrize("pad_count", [1, 3])
+def test_appending_packed_field_padding_keeps_the_real_segments(key, pad_count):
+    field = _ZERO_COPY_PAYLOADS[key]()
+
+    padded = append_packed_field_padding(key, field, segment_lengths=[2] * pad_count)
+
+    assert padded.sequence_lengths.tolist() == _ZERO_COPY_SEGMENT_LENGTHS + [2] * pad_count
+    assert padded[: len(field)] == field
+    appended = padded[len(field) :]
+    assert torch.equal(appended.values, _PACKED_PADDING_EXPECTED_ROW[key](field).expand_as(appended.values))
+
+
+@pytest.mark.parametrize(("key", "rows_per_dummy_row"), [(ROUTE_KEY, 1), (SAMPLE_SUPPORT_FIELD, 0)])
+def test_dummy_row_segments_cover_the_single_attended_token(key, rows_per_dummy_row):
+    field = _ZERO_COPY_PAYLOADS[key]()
+
+    segments = packed_dummy_row_segments(key, 3)
+
+    assert segments == [rows_per_dummy_row] * 3
+    padding = make_packed_field_padding(key, field, segment_lengths=segments)
+    assert len(padding) == 3
+    assert int(padding.cu_seqlens[-1]) == rows_per_dummy_row * 3
+
+
+def test_packed_field_padding_refuses_an_unregistered_field():
+    with pytest.raises(ValueError, match="no padding rule"):
+        make_packed_field_padding("unregistered", _ZERO_COPY_PAYLOADS[ROUTE_KEY](), segment_lengths=[1])
+
+
+_RAGGED_ROW_LENGTHS = [3, 0, 1, 0, 2]
+_RAGGED_SEGMENT_LENGTHS = [2, 3]
+
+
+def _ragged_support() -> PackedRaggedTensor:
+    return PackedRaggedTensor(
+        [torch.arange(sum(_RAGGED_ROW_LENGTHS), dtype=SAMPLE_SUPPORT_TORCH_DTYPE)],
+        cu_seqlens_from_lengths(_RAGGED_ROW_LENGTHS),
+        cu_seqlens_from_lengths(_RAGGED_SEGMENT_LENGTHS),
+    )
+
+
+def test_a_ragged_packed_field_is_a_batch_field_of_its_batch_size():
+    field = _ragged_support()
+
+    batch = TrainingInputBatch(
+        {"sequences": torch.randint(0, 10, (len(_RAGGED_SEGMENT_LENGTHS), 4)), SAMPLE_SUPPORT_FIELD: field}
+    )
+
+    assert batch.batch_size == len(_RAGGED_SEGMENT_LENGTHS)
+    assert batch[SAMPLE_SUPPORT_FIELD] is field
+    assert SAMPLE_SUPPORT_FIELD in {
+        name for name, annotation in TrainingInput.__annotations__.items() if PackedRaggedTensor in get_args(annotation)
+    }
+
+
+def test_a_ragged_packed_field_round_trips_out_of_band(oob_round_trip):
+    field = _ragged_support()
+    batch = TrainingInputBatch(
+        {"advantages": torch.randn(len(_RAGGED_SEGMENT_LENGTHS), 8), SAMPLE_SUPPORT_FIELD: field}
+    )
+    batch.metadata = {}
+
+    unpickled, _, views = oob_round_trip(batch, read_only=True)
+
+    assert [view.nbytes for view in views] == [*(column.nbytes for column in field.columns), field.row_offsets.nbytes]
+    assert unpickled[SAMPLE_SUPPORT_FIELD] == field
+    assert isinstance(unpickled[SAMPLE_SUPPORT_FIELD], PackedRaggedTensor)
+
+
+def test_chunking_and_catting_a_ragged_field_moves_both_levels():
+    field = _ragged_support()
+    batch = TrainingInputBatch(
+        {"sequences": torch.randint(0, 10, (len(_RAGGED_SEGMENT_LENGTHS), 4)), SAMPLE_SUPPORT_FIELD: field}
+    )
+
+    chunks = batch.chunk(1)
+
+    assert [chunk[SAMPLE_SUPPORT_FIELD].row_lengths.tolist() for chunk in chunks] == [[3, 0], [1, 0, 2]]
+    assert TrainingInputBatch.cat(chunks)[SAMPLE_SUPPORT_FIELD] == field
+
+
+def test_padding_a_ragged_field_appends_rows_that_hold_no_members():
+    field = _ragged_support()
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.randint(0, 10, (len(_RAGGED_SEGMENT_LENGTHS), 4)),
+            "loss_mask": torch.ones((len(_RAGGED_SEGMENT_LENGTHS), 2)),
+            SAMPLE_SUPPORT_FIELD: field,
+        }
+    )
+
+    padded = pad_training_input_batch(batch, 2)[SAMPLE_SUPPORT_FIELD]
+
+    # Each padded batch row spans as many rows as row 0, and every one of them is empty.
+    assert padded.sequence_lengths.tolist() == _RAGGED_SEGMENT_LENGTHS + [_RAGGED_SEGMENT_LENGTHS[0]] * 2
+    assert padded.row_lengths.tolist() == _RAGGED_ROW_LENGTHS + [0] * 4
+    assert torch.equal(padded.columns[0], field.columns[0])
+
+
+def test_a_field_without_a_ragged_padding_rule_refuses_to_be_padded():
+    routes = PackedRaggedTensor(
+        [torch.arange(4, dtype=torch.int16)],
+        cu_seqlens_from_lengths([2, 2]),
+        cu_seqlens_from_lengths([2]),
+    )
+
+    with pytest.raises(ValueError, match="no padding rule for its PackedRaggedTensor form"):
+        make_packed_field_padding(ROUTE_KEY, routes, segment_lengths=[1])
+
+
+def test_a_dummy_batch_row_holds_no_ragged_support_rows():
+    padding = make_packed_field_padding(
+        SAMPLE_SUPPORT_FIELD,
+        _ragged_support(),
+        segment_lengths=packed_dummy_row_segments(SAMPLE_SUPPORT_FIELD, 3),
+    )
+
+    assert padding.sequence_lengths.tolist() == [0, 0, 0]
+    assert padding.num_rows == 0
+    assert padding.num_members == 0

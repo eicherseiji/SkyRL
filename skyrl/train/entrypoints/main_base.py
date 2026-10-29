@@ -19,6 +19,9 @@ from skyrl.env_vars import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl.train.config import SkyRLTrainConfig, get_config_as_yaml_str
 from skyrl.train.dataset import PromptDataset
 from skyrl.train.generators.base import GeneratorInterface
+from skyrl.train.sampling_concurrency import (
+    build_sampling_client,
+)
 from skyrl.train.trainer import RayPPOTrainer
 from skyrl.train.utils import validate_cfg
 from skyrl.train.utils.tracking import Tracking
@@ -217,7 +220,8 @@ class BasePPOExp:
             The inference engine client.
         """
         logger.info("Initializing inference client")
-        return self._get_new_inference_client()
+        backend = self._get_new_inference_client()
+        return build_sampling_client(backend, self.cfg.generator)
 
     def _get_new_inference_client(self) -> InferenceEngineInterface:
         """New inference client using HTTP endpoints.
@@ -277,6 +281,7 @@ class BasePPOExp:
         # NOTE (sumanthrh): Instantiate tracker before trainer init.
         # We have custom validation before this step to give better error messages.
         tracker = self.get_tracker()
+        self.tracker = tracker
 
         inference_engine_client = self.get_inference_client()
 
@@ -292,6 +297,44 @@ class BasePPOExp:
             generator=generator,
             colocate_pg=self.colocate_pg,
         )
+        if trainer._vllm_metrics_scraper is not None:
+            enable_pd = self.cfg.generator.inference_engine.enable_pd
+            groups = (
+                (self._prefill_server_groups or []) + (self._decode_server_groups or [])
+                if enable_pd
+                else self._server_groups
+            )
+            actors = [actor for group in (groups or []) for actor in group.get_actors()]
+            if actors and self.cfg.generator.inference_engine.backend == "vllm":
+                try:
+                    worker_ids = ray.get([actor.get_ray_worker_id.remote() for actor in actors], timeout=10)
+                    if enable_pd:
+                        num_prefill = sum(len(group.get_actors()) for group in (self._prefill_server_groups or []))
+                        trainer._vllm_metrics_scraper.set_worker_roles(
+                            {"prefill": worker_ids[:num_prefill], "decode": worker_ids[num_prefill:]}
+                        )
+                    else:
+                        trainer._vllm_metrics_scraper.set_worker_ids(worker_ids)
+                except Exception as error:
+                    trainer._vllm_metrics_scraper.set_worker_ids([])
+                    logger.warning(
+                        f"vLLM metrics disabled: could not identify launched workers ({type(error).__name__})"
+                    )
+            elif self.cfg.generator.inference_engine.external_server_urls is not None:
+                try:
+                    asyncio.run(
+                        trainer._vllm_metrics_scraper.set_external_servers(
+                            self.cfg.generator.inference_engine.external_server_urls, enable_pd
+                        )
+                    )
+                except Exception as error:
+                    trainer._vllm_metrics_scraper.set_worker_ids([])
+                    logger.warning(
+                        f"vLLM metrics disabled: could not identify external workers ({type(error).__name__})"
+                    )
+            else:
+                trainer._vllm_metrics_scraper.set_worker_ids([])
+                logger.warning("vLLM metrics disabled: no inference frontend workers identified")
         # Install the trajectory logger after construction
         trainer.trajectory_logger = self.get_trajectory_logger()
         # Expose the trainer on self so callers can log exceptions raised
@@ -315,10 +358,22 @@ class BasePPOExp:
 
     def run(self):
         self.trainer = None
+        self.tracker = None
+        status = "failed"
+        annotation = None
+        trainer_cfg = getattr(getattr(self, "cfg", None), "trainer", None)
+        annotation_cfg = getattr(trainer_cfg, "grafana_annotations", None)
+        if annotation_cfg is not None and annotation_cfg.enabled:
+            from skyrl.train.utils.grafana_annotations import GrafanaRunAnnotation
+
+            annotation = GrafanaRunAnnotation(annotation_cfg, trainer_cfg.run_name)
+            annotation.start()
         try:
             trainer = self._setup_trainer()
+
             # Start the training loop
-            asyncio.run(trainer.train())
+            asyncio.run(self._run_with_sampling_service(trainer))
+            status = "success"
         except Exception as e:
             # OOMs raised inside actor init (e.g. FSDPPolicyWorkerBase.init_model)
             # surface here as RayTaskError. Without this they only land in Ray
@@ -333,6 +388,37 @@ class BasePPOExp:
             else:
                 logger.error(f"Setup failed before tracker was initialized:\n{e}")
             raise
+        finally:
+            if annotation is not None:
+                annotation.finish()
+            if self.tracker is not None:
+                try:
+                    self.tracker.run_status = status
+                    self.tracker.update_summary({"run_status": status})
+                    self.tracker.finish(exit_code=0 if status == "success" else 1)
+                except Exception as finalization_error:
+                    logger.warning(f"Could not finish run tracking: {finalization_error}")
+
+    async def _run_with_sampling_service(self, trainer: RayPPOTrainer) -> None:
+        """Bind and close optional sampling-service lifecycle on the trainer loop."""
+
+        inference_engine_client = getattr(trainer, "inference_engine_client", None)
+        start = getattr(inference_engine_client, "start", None)
+        if start is not None:
+            start()
+        run_status = "failed"
+        try:
+            await trainer.train()
+            run_status = "success"
+        finally:
+            try:
+                await trainer.finalize_metrics(run_status)
+            except Exception as finalization_error:
+                logger.warning(f"Could not finalize run metrics: {finalization_error}")
+            finally:
+                aclose_service = getattr(inference_engine_client, "aclose_service", None)
+                if aclose_service is not None:
+                    await aclose_service()
 
 
 @ray.remote(num_cpus=1)

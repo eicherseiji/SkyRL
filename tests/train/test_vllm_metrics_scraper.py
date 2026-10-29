@@ -3,15 +3,22 @@ uv run --isolated --extra dev pytest tests/train/test_vllm_metrics_scraper.py
 """
 
 import asyncio
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import httpx
 import pytest
 
 from skyrl.train.utils.vllm_metrics_scraper import (
+    VLLMEngineFeedbackProducer,
     VLLMMetricsScraper,
     aggregate,
     discover_ray_metrics_urls,
     parse_metrics_text,
+)
+from skyrl.utils.adaptive_concurrency import (
+    FixedConcurrencyPolicy,
+    SamplingConcurrencyController,
+    VLLMEngineSamplingFeedback,
 )
 
 
@@ -108,6 +115,23 @@ def _spec_snapshot(*, drafts: float, draft_tokens: float, accepted_tokens: float
     return "\n".join(lines) + "\n"
 
 
+def _engine_load_snapshot(*, preemptions: int, include_kv: bool = True) -> str:
+    labels = 'ReplicaId="r0",engine="0",model_name="test"'
+    lines = [
+        f"ray_vllm_num_requests_running{{{labels}}} 12",
+        f"ray_vllm_num_requests_waiting{{{labels}}} 4",
+        f'ray_vllm_num_requests_waiting_by_reason{{{labels},reason="capacity"}} 3',
+        f"ray_vllm_num_preemptions_total{{{labels}}} {preemptions}",
+        (
+            f'ray_vllm_cache_config_info{{{labels},kv_cache_size_tokens="131072",'
+            'num_gpu_blocks="1",block_size="16"} 1'
+        ),
+    ]
+    if include_kv:
+        lines.append(f"ray_vllm_kv_cache_usage_perc{{{labels}}} 0.72")
+    return "\n".join(lines) + "\n"
+
+
 def test_parse_and_aggregate_sum_and_mean():
     text = _snapshot(
         running=4,
@@ -151,6 +175,115 @@ def test_aggregate_omits_missing_metric():
     )
     result = aggregate(parsed, ["does_not_exist"], how="sum")
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_scraper_produces_coherent_engine_load_and_preemption_deltas():
+    scraper = VLLMMetricsScraper(urls=["http://stub/metrics"])
+    texts = iter([_engine_load_snapshot(preemptions=10), _engine_load_snapshot(preemptions=13)])
+
+    async def fake_fetch_all():
+        return parse_metrics_text(next(texts))
+
+    with patch.object(scraper, "_fetch_all", fake_fetch_all):
+        first = await scraper.engine_feedback(max_model_len=32_768)
+        second = await scraper.engine_feedback(max_model_len=32_768)
+
+    assert isinstance(first, VLLMEngineSamplingFeedback)
+    assert first.engine_loads[0].engine_id == "r0.0"
+    assert first.engine_loads[0].kv_capacity_tokens == 131_072
+    assert first.engine_loads[0].max_model_len == 32_768
+    assert first.engine_loads[0].kv_usage == pytest.approx(0.72)
+    assert first.engine_loads[0].running == 12
+    assert first.engine_loads[0].waiting == 4
+    assert first.engine_loads[0].waiting_capacity == 3
+    assert first.engine_loads[0].preemptions_delta == 0
+    assert second.engine_loads[0].preemptions_delta == 3
+
+
+@pytest.mark.asyncio
+async def test_scraper_omits_incomplete_engine_load_instead_of_assuming_clear():
+    scraper = VLLMMetricsScraper(urls=["http://stub/metrics"])
+
+    async def fake_fetch_all():
+        return parse_metrics_text(_engine_load_snapshot(preemptions=0, include_kv=False))
+
+    with patch.object(scraper, "_fetch_all", fake_fetch_all):
+        assert await scraper.engine_feedback() is None
+
+
+@pytest.mark.asyncio
+async def test_vllm_feedback_producer_pushes_scrape_into_controller():
+    class RecordingPolicy(FixedConcurrencyPolicy):
+        feedback = None
+
+        def on_feedback(self, feedback, context):
+            self.feedback = feedback
+            return None
+
+    scraper = VLLMMetricsScraper(urls=["http://stub/metrics"])
+
+    async def fake_fetch_all():
+        return parse_metrics_text(_engine_load_snapshot(preemptions=0))
+
+    policy = RecordingPolicy()
+    controller = SamplingConcurrencyController(policy=policy, initial_limit=8)
+    producer = VLLMEngineFeedbackProducer(controller, scraper=scraper)
+    with patch.object(scraper, "_fetch_all", fake_fetch_all):
+        assert await producer.poll_once() is None
+
+    assert isinstance(policy.feedback, VLLMEngineSamplingFeedback)
+    await producer.aclose()
+
+
+@pytest.mark.asyncio
+async def test_native_vllm_metrics_are_normalized_and_kept_distinct_by_server():
+    urls = ["http://engine-a/metrics", "http://engine-b/metrics"]
+    scraper = VLLMMetricsScraper(urls=urls)
+
+    def native_snapshot(running: int) -> str:
+        labels = 'engine="0",model_name="test"'
+        return "\n".join(
+            [
+                f"vllm:num_requests_running{{{labels}}} {running}",
+                f"vllm:num_requests_waiting{{{labels}}} 3",
+                f"vllm:kv_cache_usage_perc{{{labels}}} 0.25",
+                f"vllm:num_preemptions_total{{{labels}}} 0",
+            ]
+        )
+
+    payloads = {
+        urls[0]: native_snapshot(1),
+        urls[1]: native_snapshot(2),
+    }
+
+    async def fake_fetch_one(_client, url):
+        return payloads[url]
+
+    with patch.object(scraper, "_fetch_one", fake_fetch_one):
+        feedback = await scraper.engine_feedback()
+
+    assert isinstance(feedback, VLLMEngineSamplingFeedback)
+    assert len(feedback.engine_loads) == 2
+    assert {load.engine_id for load in feedback.engine_loads} == {
+        "http://engine-a/metrics.0",
+        "http://engine-b/metrics.0",
+    }
+    assert {load.running for load in feedback.engine_loads} == {1, 2}
+    await scraper.aclose()
+
+
+def test_feedback_producer_scrapes_native_model_server_endpoints():
+    controller = SamplingConcurrencyController(policy=FixedConcurrencyPolicy(), initial_limit=1)
+    producer = VLLMEngineFeedbackProducer(
+        controller,
+        model_server_urls=["http://engine-a/", "http://engine-b"],
+    )
+
+    assert producer._scraper._urls == [
+        "http://engine-a/metrics",
+        "http://engine-b/metrics",
+    ]
 
 
 @pytest.mark.asyncio
@@ -241,7 +374,8 @@ async def test_scraper_second_call_derives_rates_and_averages():
     assert out["vllm/prompt_throughput_tok_s"] == pytest.approx(100.0)
     assert out["vllm/prefix_cache_hit_rate"] == pytest.approx(40.0 / 50.0)
     assert out["vllm/ttft_seconds_avg"] == pytest.approx(1.0 / 5.0)
-    assert out["vllm/tpot_seconds_avg"] == pytest.approx(0.5 / 100.0)
+    assert "vllm/tpot_seconds_avg" not in out
+    assert "vllm/itl_seconds_avg" not in out
     # Gauges still flow through.
     assert out["vllm/num_requests_running"] == pytest.approx(5)
     assert out["vllm/kv_cache_usage_perc"] == pytest.approx(0.35)
@@ -362,7 +496,8 @@ async def test_scraper_throughput_uses_generation_time_not_wall_clock():
     # Time-independent derived metrics are unchanged by the window choice.
     assert out["vllm/prefix_cache_hit_rate"] == pytest.approx(40.0 / 50.0)
     assert out["vllm/ttft_seconds_avg"] == pytest.approx(1.0 / 5.0)
-    assert out["vllm/tpot_seconds_avg"] == pytest.approx(0.5 / 100.0)
+    assert "vllm/tpot_seconds_avg" not in out
+    assert "vllm/itl_seconds_avg" not in out
 
 
 @pytest.mark.asyncio
@@ -677,3 +812,165 @@ def test_discover_ray_metrics_urls_filters_dead_and_missing(monkeypatch):
         "http://10.0.0.1:51001/metrics",
         "http://10.0.0.4:51004/metrics",
     ]
+
+
+@pytest.mark.asyncio
+async def test_worker_filter_and_merged_latency_buckets():
+    from unittest.mock import AsyncMock
+
+    scraper = VLLMMetricsScraper(urls=["http://test/metrics"], worker_ids=["ours"])
+    text = """ray_vllm_generation_tokens_total{WorkerId="ours"} 10
+ray_vllm_generation_tokens_total{WorkerId="other"} 900
+ray_vllm_time_to_first_token_seconds_bucket{WorkerId="ours",le="1"} 2
+ray_vllm_time_to_first_token_seconds_bucket{WorkerId="ours",le="+Inf"} 3
+ray_vllm_time_to_first_token_seconds_bucket{WorkerId="other",le="1"} 900
+"""
+    scraper._fetch_all = AsyncMock(return_value=parse_metrics_text(text))
+    snapshot = await scraper._read_snapshot()
+    assert snapshot["ray_vllm_generation_tokens_total"] == 10
+    assert snapshot["ray_vllm_time_to_first_token_seconds_bucket::1"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sync", [False, True])
+async def test_cold_start_tokens_are_included_in_step_and_run_metrics(monkeypatch, sync):
+    phase = 0
+    now = 0.0
+    monkeypatch.setattr("skyrl.train.utils.vllm_metrics_scraper.time", Mock(monotonic=lambda: now))
+
+    def respond(request):
+        text = 'ray_vllm_num_requests_running{WorkerId="worker"} 0\n'
+        if phase:
+            generated, prompted = {1: (100, 200), 2: (300, 500)}[phase]
+            text += (
+                f'ray_vllm_generation_tokens_total{{WorkerId="worker"}} {generated}\n'
+                f'ray_vllm_prompt_tokens_total{{WorkerId="worker"}} {prompted}\n'
+            )
+        return httpx.Response(200, text=text)
+
+    scraper = VLLMMetricsScraper(urls=["http://test/metrics"], worker_ids=["worker"])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        scraper._client = client
+        if not sync:
+            await scraper.sample()
+        for next_phase, seconds in ((1, 2), (2, 8)):
+            if sync:
+                await scraper.start("vllm/train")
+            phase = next_phase
+            now += seconds
+            metrics = await scraper.stop() if sync else await scraper.sample()
+            if phase == 1:
+                prefix = "vllm/train/" if sync else "vllm/"
+                assert metrics[prefix + "generation_throughput_tok_s"] == 50
+                assert metrics[prefix + "prompt_throughput_tok_s"] == 100
+        summary = scraper.run_statistics.summary()
+
+    prefix = "vllm_correct_aggregate/train/" if sync else "vllm_correct_aggregate/combined/"
+    assert summary[prefix + "output_tokens_total"] == 300
+    assert summary[prefix + "prompt_tokens_total"] == 500
+    assert summary[prefix + "generation_throughput_tok_s"] == 30
+    assert summary[prefix + "prompt_throughput_tok_s"] == 50
+    assert summary[prefix + "measurement_seconds"] == 10
+
+
+@pytest.mark.asyncio
+async def test_failed_node_scrape_skips_partial_totals_and_reestablishes_baseline():
+    step = 0
+
+    def respond(request):
+        worker = request.url.host
+        if step == 1 and worker == "b":
+            return httpx.Response(503)
+        text = (
+            f'ray_vllm_num_requests_running{{WorkerId="{worker}"}} 1\n'
+            f'ray_vllm_generation_tokens_total{{WorkerId="{worker}"}} {step * 10}\n'
+        )
+        return httpx.Response(200, text=text)
+
+    scraper = VLLMMetricsScraper(urls=["http://a/metrics", "http://b/metrics"], worker_ids=["a", "b"])
+    with patch("skyrl.train.utils.vllm_metrics_scraper.logger") as mock_logger:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            scraper._client = client
+            await scraper.sample(generation_time_s=1)
+            step = 1
+            assert await scraper.sample(generation_time_s=1) == {}
+            step = 2
+            recovered = await scraper.sample(generation_time_s=1)
+            assert "vllm/generation_throughput_tok_s" not in recovered
+            step = 3
+            metrics = await scraper.sample(generation_time_s=1)
+    mock_logger.warning.assert_called_once()
+    assert "503" in mock_logger.warning.call_args.args[0]
+    assert metrics["vllm/generation_throughput_tok_s"] == 20
+
+
+def test_offload_and_preemption_scalar_reductions():
+    current = {
+        "ray_vllm_num_preemptions_total": 2,
+        "ray_vllm_generation_tokens_total": 100,
+        "ray_vllm_external_prefix_cache_queries_total": 30,
+        "ray_vllm_external_prefix_cache_hits_total": 12,
+        "ray_vllm_kv_offload_store_bytes_total": 1000,
+        "ray_vllm_kv_offload_load_bytes_total": 500,
+    }
+    metrics = VLLMMetricsScraper._derive(current, dict.fromkeys(current, 0), 5, "vllm/")
+    assert metrics["vllm/num_preemptions"] == 2
+    assert metrics["vllm/preemptions_per_million_tokens"] == 20000
+    assert metrics["vllm/external_prefix_cache_hit_rate"] == 0.4
+    assert "vllm/kv_offload_store_throughput_bytes_s" not in metrics
+    assert metrics["vllm/kv_offload_load_throughput_bytes_s"] == 100
+
+
+def test_logged_tpot_uses_request_histogram_and_only_mean_p90():
+    current = {}
+    for name, count, total in [
+        ("time_to_first_token_seconds", 10, 12),
+        ("request_time_per_output_token_seconds", 4, 2),
+        ("inter_token_latency_seconds", 100, 0.1),
+    ]:
+        base = "ray_vllm_" + name
+        current.update(
+            {
+                base + "_count": count,
+                base + "_sum": total,
+                base + "_bucket::1": count / 2,
+                base + "_bucket::2": count,
+                base + "_bucket::+Inf": count,
+            }
+        )
+    metrics = VLLMMetricsScraper._derive(current, dict.fromkeys(current, 0), 5, "vllm/")
+    assert metrics["vllm/tpot_seconds_avg"] == pytest.approx(0.5)
+    assert metrics["vllm/tpot_seconds_p90"] == pytest.approx(1.8)
+    assert metrics["vllm/ttft_seconds_avg"] == pytest.approx(1.2)
+    assert metrics["vllm/ttft_seconds_p90"] == pytest.approx(1.8)
+    assert not any("itl" in key or "request_tpot" in key or "p50" in key for key in metrics)
+
+
+@pytest.mark.parametrize("error", [None, RuntimeError("identity failed"), TimeoutError("identity timed out")])
+def test_worker_identity_lookup_is_bounded_and_failure_does_not_abort_setup(tmp_path, monkeypatch, error):
+    from skyrl.train.config import SkyRLTrainConfig
+    from skyrl.train.entrypoints.main_base import BasePPOExp
+
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.export_path = str(tmp_path / "export")
+    cfg.trainer.ckpt_path = str(tmp_path / "checkpoints")
+    cfg.trainer.fully_async.simulate_training = True
+    experiment = BasePPOExp.__new__(BasePPOExp)
+    experiment.cfg = cfg
+    experiment.tokenizer = Mock()
+    experiment.train_dataset = None
+    experiment.eval_dataset = None
+    experiment.colocate_pg = None
+    actor = Mock()
+    actor.get_ray_worker_id.remote.return_value = "identity-ref"
+    experiment._server_groups = [Mock(get_actors=Mock(return_value=[actor]))]
+    trainer = Mock()
+    experiment.get_trainer = Mock(return_value=trainer)
+    for method in ("get_tracker", "get_inference_client", "get_generator", "get_trajectory_logger"):
+        setattr(experiment, method, Mock())
+    lookup = Mock(return_value=["owner"], side_effect=error)
+    monkeypatch.setattr("skyrl.train.entrypoints.main_base.ray.get", lookup)
+
+    assert experiment._setup_trainer() is trainer
+    lookup.assert_called_once_with(["identity-ref"], timeout=10)
+    trainer._vllm_metrics_scraper.set_worker_ids.assert_called_once_with([] if error else ["owner"])

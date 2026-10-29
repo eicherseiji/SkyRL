@@ -40,6 +40,14 @@ class _SimDispatch:
         # ``convert_to_training_input`` (pad to a multiple of dp_size) is a no-op.
         return 1
 
+    def get_timing_metrics(self) -> dict:
+        """Simulated weight sync has no model-transfer timing metrics."""
+        return {}
+
+    def finalize_pending_saves(self, role: str) -> None:
+        """The simulation has no model checkpoint writes to finish."""
+        pass
+
     async def save_weights_for_sampler(self):
         await self._client.pause_generation()
         try:
@@ -49,6 +57,11 @@ class _SimDispatch:
             await self._client.resume_generation()
         # Mirror the real dispatch: advance the policy version after the (simulated) sync.
         self._client.increment_weight_version()
+
+    def finalize_pending_saves(self, role: str) -> None:
+        """Match the real dispatch cleanup contract; simulation never saves."""
+
+        _ = role
 
 
 class FullyAsyncTrainerSim(FullyAsyncRayPPOTrainer):
